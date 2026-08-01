@@ -39,15 +39,27 @@ Pkg.activate(".")
 Pkg.instantiate()
 ```
 
-Run the current example with:
+Run the scalar-advection example with:
 
 ```sh
-julia --project=. example/advection.jl
+julia --project=. example/advection_convergence.jl
 ```
 
 The example solves the constant-coefficient advection equation on a periodic
 one-dimensional domain and plots the numerical solution alongside its initial
 state.
+
+Run the active-flux BGK Sod shock tube with:
+
+```sh
+julia --project=. src/sod.jl
+```
+
+The shock-tube solver uses the pure `1d1f1v` model with `K=0`, `γ=3`, and
+kinetic inflow/outflow boundaries. A positivity-preserving shock limiter blends
+the active-flux transport locally toward upwind transport at discontinuities.
+The resulting density, velocity, and pressure are plotted together with the
+exact Euler Riemann solution for comparison.
 
 ## License
 
