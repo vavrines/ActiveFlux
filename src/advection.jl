@@ -486,6 +486,8 @@ function print_diagnostics(result)
     return nothing
 end
 
-result = solve_bgk_active_flux()
-print_diagnostics(result)
-display(plot_solution(result))
+if abspath(PROGRAM_FILE) == @__FILE__
+    result = solve_bgk_active_flux()
+    print_diagnostics(result)
+    display(plot_solution(result))
+end
