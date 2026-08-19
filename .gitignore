@@ -1,2 +1,8 @@
 Manifest.toml
-tex/main.pdf
+
+data/*.jld2
+
+tex/*
+!tex/main.tex
+!tex/references.bib
+
