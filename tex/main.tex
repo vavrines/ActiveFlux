@@ -4,6 +4,7 @@
 \usepackage{amsmath,amssymb,mathtools}
 \usepackage{booktabs}
 \usepackage{graphicx}
+\usepackage{placeins}
 \usepackage{microtype}
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
@@ -13,6 +14,11 @@
 \newcommand{\avg}[1]{\overline{#1}}
 \newcommand{\R}{\mathbb{R}}
 \newcommand{\cfl}{\mathrm{CFL}}
+\newcommand{\resultplaceholder}[1]{%
+  \begin{center}
+    \fbox{\parbox{0.86\textwidth}{\centering\textit{Result placeholder.} #1}}
+  \end{center}%
+}
 
 \begin{document}
 
@@ -35,11 +41,11 @@
 }
 
 \begin{abstract}
-It is challenging to construct high-order kinetic solvers that remain compact in physical space and preserve the conservative structure of particle transport and collision. This paper addresses the formulation and implementation of an active flux method for the one-dimensional Bhatnagar--Gross--Krook equation. The particle distribution function is represented by cell averages and shared point values at cell interfaces. A continuous quadratic reconstruction follows directly from these degrees of freedom, and the interface values are evolved along molecular characteristics. The time-averaged interface distributions provide conservative kinetic fluxes without a Riemann solver. Exact local relaxation is combined with transport by Strang splitting. To retain high spatial accuracy for the nonlinear collision term, the reconstruction is relaxed at Gaussian quadrature points before being integrated back to the cell average. A discrete Maxwellian correction matches mass, momentum, and energy moments on the truncated velocity grid and reduces collision-invariant drift to roundoff. For discontinuous solutions, a kinetic jump sensor and conservative positivity correction blend the active flux evolution locally with an upwind update. Numerical experiments identify third-order convergence of the collisionless transport operator for both the distribution function and density. With a temporally over-resolved Strang step, the full BGK solver recovers the same asymptotic spatial order. The Sod shock tube demonstrates the robustness of the current formulation in the continuum regime. The complete Julia implementation is supplied with the manuscript.
+It is challenging to construct high-order Boltzmann solvers that remain compact in physical space and preserve the conservative structure of particle transport and collision. Taking the full Boltzmann equation as the governing model, this paper develops an active flux kinetic formulation on one- and two-dimensional Cartesian domains. Velocity discretization produces a coupled system in which every molecular-velocity component undergoes linear physical transport while all components remain coupled through the nonlinear collision integral. Active flux is applied to this physical-space system: cell averages and shared boundary point values define a continuous reconstruction, evolved boundary data provide space--time kinetic fluxes without a Riemann solver, and the collision operator is evaluated locally in physical space with a conservative velocity-space discretization. A quadratic reconstruction is used in one dimension and a continuous biparabolic reconstruction in two dimensions. A complementary method-of-lines formulation advances the same degrees of freedom with explicit Runge--Kutta or implicit--explicit Runge--Kutta methods. The collision interface is formulated first for the Boltzmann integral, with conservative fast spectral evaluation and moment projection. The Bhatnagar--Gross--Krook model is introduced as a simplified collision specialization for verification, asymptotic analysis, and penalization. A formal hydrodynamic-limit argument identifies the requirements for an Euler-limit asymptotic-preserving realization and motivates a penalized treatment of the full Boltzmann operator. The numerical study is organized around four cases: accuracy tests, the Sod problem, normal shock structure, and a two-dimensional lid-driven cavity. One-dimensional BGK tests identify third-order transport and density convergence. The Sod problem is then solved with a three-dimensional molecular-velocity grid and the full fast-spectral Boltzmann collision integral at reference Knudsen numbers $10^{-4}$, $10^{-2}$, and $1$. A preliminary normal-shock calculation compares full Boltzmann and BGK collisions and shows that heat flux distinguishes them earlier than the conserved macroscopic profiles. Steady shock refinement, the cavity, and uniform-in-Knudsen asymptotic validation remain to be completed.
 \end{abstract}
 
 \begin{keyword}
-Boltzmann equation \sep BGK model \sep active flux \sep high-order method \sep kinetic theory \sep shock capturing
+Boltzmann equation \sep BGK model \sep active flux \sep Runge--Kutta method \sep asymptotic-preserving scheme \sep kinetic theory
 \end{keyword}
 
 \end{frontmatter}
@@ -51,88 +57,222 @@ Gaseous flows possess a multi-scale structure. At the molecular mean-free-path s
 
 High-order kinetic methods are attractive because phase-space discretization produces many degrees of freedom even on a modest mesh. Improving the accuracy achieved per physical cell can therefore reduce both memory consumption and collision cost. Existing constructions include discontinuous Galerkin, flux reconstruction, semi-Lagrangian, and high-order finite-volume formulations. A flux reconstruction kinetic scheme has demonstrated that compact polynomial representations and kinetic upwinding can be combined with the full Boltzmann collision integral \cite{xiao2021flux}. Scale-dependent kinetic fluxes have also been incorporated into stochastic Galerkin and collocation settings for uncertain multi-scale flow transport \cite{xiao2021stochastic}. More recently, differentiable programming has coupled kinetic solvers with gradient-based model discovery and numerical optimization \cite{xiao2025differentiable}. These developments share the objective of embedding physical structure into algorithms that remain flexible for scientific computing.
 
-The active flux method offers a different route to compact high-order discretization. It evolves cell averages together with point values located at cell interfaces. The additional values define a globally continuous reconstruction and provide the interface flux directly after an evolution step. Eymann and Roe introduced the formulation for hyperbolic systems and explored schemes up to third order without enlarging the stencil \cite{eymann2011active}. Subsequent studies clarified the construction for nonlinear problems, balance laws, and arbitrary order extensions \cite{barsukow2021nonlinear,barsukow2021source,abgrall2023extensions}. The combination of conservative averages and independently evolved boundary values is particularly appealing for kinetic equations: at every molecular velocity, particle transport is a scalar advection problem with a known characteristic direction.
+The active flux method offers a different route to compact high-order discretization. It evolves cell averages together with point values located at cell interfaces. The additional values define a globally continuous reconstruction and provide the interface flux directly after an evolution step. Eymann and Roe introduced the formulation for hyperbolic systems and explored schemes up to third order without enlarging the stencil \cite{eymann2011active}. Subsequent studies clarified the construction for two-dimensional Cartesian grids, nonlinear problems, balance laws, and arbitrary order extensions \cite{barsukow2019cartesian,barsukow2021nonlinear,barsukow2021source,abgrall2023extensions}. The combination of conservative averages and independently evolved boundary values is particularly appealing for kinetic equations: at every molecular velocity, particle transport is a scalar advection problem with a known characteristic direction.
 
-Active flux methods have recently been used for kinetic transport in the Vlasov--Poisson system, where a compact third-order discretization and a positivity-preserving limiter were developed \cite{kiechle2025positivity}. However, the inclusion of collisional relaxation changes the numerical structure. The equilibrium is a nonlinear functional of velocity moments, its cell average is not equal to the equilibrium evaluated from a cell-averaged distribution, and a finite velocity quadrature does not reproduce the moments of the analytic Maxwellian exactly. These issues need to be addressed before active flux can be applied reliably to collisional gas dynamics.
+Active flux methods have recently been used for kinetic transport in the Vlasov--Poisson system, where a compact third-order discretization and a positivity-preserving limiter were developed \cite{kiechle2025positivity}. Collisional gas dynamics introduces a different numerical structure. The Boltzmann collision operator is a nonlinear, velocity-space integral that is local in physical space, whereas its BGK approximation is a nonlinear relaxation toward an equilibrium determined by velocity moments. A truncated velocity discretization can also violate the collision invariants unless its discrete moments are corrected. These issues must be handled without destroying the compact physical-space reconstruction.
 
-In this paper, an active flux kinetic scheme is constructed for the one-dimensional BGK equation. The current contribution is summarized as follows.
+In this paper, an active flux kinetic framework is constructed for the Boltzmann equation in one and two physical dimensions. The derivation starts from the discrete-velocity Boltzmann system, not from a relaxation equation: active flux discretizes physical transport, while the local velocity-space collision routine is a replaceable module. BGK is invoked only when an inexpensive collision model, an exact relaxation map, or a controlled verification problem is useful. The main elements are summarized as follows.
 \begin{itemize}
-  \item The active flux reconstruction and characteristic evolution are applied independently at every discrete molecular velocity. Exact time-averaged interface distributions yield a conservative third-order transport update.
-  \item The nonlinear BGK relaxation is evaluated pointwise at physical-space Gaussian nodes. Exact relaxation and Gaussian integration then provide a high-order cell-average collision update.
-  \item A moment correction is introduced for the discrete Maxwellian. The resulting collision step preserves the mass, momentum, and energy associated with the adopted velocity quadrature to roundoff.
-  \item A kinetic jump sensor, upwind blending, and positivity correction are incorporated for shock solutions. Fixed reservoirs are imposed only on incoming molecular characteristics at open boundaries.
-  \item The Julia implementation is verified through exact free transport, a temporally over-resolved BGK convergence study, and the Sod shock tube.
+  \item The active flux reconstruction and characteristic evolution are applied independently at every discrete molecular velocity. The one-dimensional quadratic reconstruction is extended to two-dimensional Cartesian cells through a continuous biparabolic polynomial determined by one cell average and eight shared boundary values.
+  \item Evolved corner and edge-midpoint values are integrated with a space--time Simpson rule to provide a conservative third-order transport update in two dimensions.
+  \item The collision interface is designed to accept either the full Boltzmann operator, evaluated by a fast spectral method, or the BGK relaxation model. Tensor-product physical-space quadrature retains the spatial order of the nonlinear collision update.
+  \item A discrete moment projection enforces the collision invariants of the full operator. For BGK relaxation, a corrected discrete Maxwellian reproduces the same quadrature moments.
+  \item The active flux evolution is also expressed as a semi-discrete right-hand side for the combined cell-average and boundary-point state. The same operator can therefore be advanced by explicit Runge--Kutta methods or partitioned into transport and collision for implicit--explicit integration.
+  \item The hydrodynamic limit is analyzed at fixed mesh spacing and time step. A degree-of-freedom equilibrium projection gives the BGK collision operator an exact discrete null space, while a stiffly accurate implicit--explicit scheme removes the collision-time stability restriction. A penalized construction supplies the corresponding target for the full Boltzmann operator.
+  \item The numerical programme contains four cases of increasing complexity: accuracy tests, the Sod problem, normal shock structure, and a two-dimensional lid-driven cavity. The current Julia results cover one-dimensional BGK accuracy tests, a full-Boltzmann Sod calculation at three reference Knudsen numbers, and a preliminary full-Boltzmann/BGK normal-shock comparison; the two-dimensional cavity remains the principal multidimensional validation target.
 \end{itemize}
 
-The implementation uses the data structures and kinetic-theory functions of \texttt{KitBase.jl}, which forms part of the open-source \texttt{Kinetic.jl} ecosystem \cite{xiao2021kinetic}. Julia provides the multiple-dispatch and generic-programming facilities used to keep the numerical formulation close to its mathematical expression \cite{bezanson2017julia}.
+The implementation uses the data structures and kinetic-theory functions of \texttt{KitBase.jl}, which forms part of the open-source \texttt{Kinetic.jl} ecosystem \cite{xiao2021kinetic}. The semi-discrete operators follow the in-place problem interface of \texttt{OrdinaryDiffEq.jl}, so the spatial discretization is not tied to one time integrator \cite{rackauckas2017differentialequations}. Julia provides the multiple-dispatch and generic-programming facilities used to keep the numerical formulation close to its mathematical expression \cite{bezanson2017julia}.
 
-The rest of this paper is organized as follows. Section~\ref{sec:kinetic} presents the kinetic model and its velocity moments. Section~\ref{sec:algorithm} describes the active flux reconstruction, transport evolution, collision update, and discontinuity treatment. Section~\ref{sec:accuracy} identifies the accuracy and conservation properties of the method. Section~\ref{sec:sod} presents the Sod shock tube. The last section is the conclusion.
+The rest of this paper is organized as follows. Section~\ref{sec:kinetic} presents the Boltzmann equation, its BGK specialization, and the velocity moments. Section~\ref{sec:algorithm} describes the one- and two-dimensional active flux reconstructions, semi-discrete and characteristic transport forms, collision update, asymptotic analysis, and discontinuity treatment. Section~\ref{sec:numerical} presents the four numerical cases, with completed results and planned validation clearly distinguished. The last section is the conclusion.
 
 \section{Kinetic theory}
 \label{sec:kinetic}
 
-The Boltzmann equation tracks the temporal-spatial evolution of the particle distribution function $f(t,\vct{x},\vct{v})$. In the absence of an external force, it writes
+The Boltzmann equation tracks the temporal-spatial evolution of the particle distribution function $f(t,\vct{x},\vct{v})$, where $\vct{x}\in\Omega_x\subset\R^{d_x}$, $\vct{v}\in\R^{d_v}$, and $d_x\in\{1,2\}$. Denote by $\vct{v}_x=(v_1,\ldots,v_{d_x})^T$ the molecular-velocity components associated with physical transport. In the absence of an external force, the equation reads
 \begin{equation}
   \frac{\partial f}{\partial t}
-  + \vct{v}\cdot\nabla_{\vct{x}} f
+  + \vct{v}_x\cdot\nabla_{\vct{x}} f
   = \mathcal{Q}(f,f),
   \label{eq:boltzmann}
 \end{equation}
-where $\mathcal{Q}$ is the nonlinear collision integral. The macroscopic conservative variables are velocity moments of $f$,
+where the full collision operator is
+\begin{align}
+  \mathcal{Q}(f,f)(\vct{v})
+  ={}& \int_{\R^{d_v}}\int_{\mathbb{S}^{d_v-1}}
+  B\bigl(|\vct{g}|,\vct{\sigma}\cdot\widehat{\vct{g}}\bigr)
+  \left(f'f_*'-ff_*\right)\dd\vct{\sigma}\dd\vct{v}_*,
+  \label{eq:collision-operator}\\
+  \vct{v}'={}&\frac{\vct{v}+\vct{v}_*}{2}
+  +\frac{|\vct{g}|}{2}\vct{\sigma},
+  \qquad
+  \vct{v}_*'=\frac{\vct{v}+\vct{v}_*}{2}
+  -\frac{|\vct{g}|}{2}\vct{\sigma},
+  \qquad
+  \vct{g}=\vct{v}-\vct{v}_*.
+  \label{eq:post-collision}
+\end{align}
+Here, $B$ is the collision kernel and primes denote post-collision distributions. The operator is local in $(t,\vct{x})$ but nonlocal and quadratic in molecular velocity. The macroscopic conservative variables are velocity moments of $f$,
 \begin{equation}
   \vct{W}
   =
   \begin{pmatrix}
     \rho \\
-    \rho U \\
+    \rho\vct{U} \\
     \rho E
   \end{pmatrix}
-  = \int_{\R} f\vct{\psi}\dd v,
+  = \int_{\R^{d_v}} f\vct{\psi}\dd\vct{v},
   \qquad
-  \vct{\psi}(v)
+  \vct{\psi}(\vct{v})
   =
   \begin{pmatrix}
     1 \\
-    v \\
-    v^2/2
+    \vct{v} \\
+    |\vct{v}|^2/2
   \end{pmatrix}.
   \label{eq:moments}
 \end{equation}
 The vector $\vct{\psi}$ contains the collision invariants. Consequently,
 \begin{equation}
-  \int_{\R} \mathcal{Q}(f,f)\vct{\psi}\dd v = \vct{0}.
+  \int_{\R^{d_v}} \mathcal{Q}(f,f)\vct{\psi}\dd\vct{v} = \vct{0}.
   \label{eq:compatibility}
 \end{equation}
 
-The BGK model replaces the fivefold Boltzmann collision integral with relaxation toward the Maxwellian distribution \cite{bhatnagar1954model},
+The velocity domain is discretized by points $\vct{v}_{\vct{j}}$ and quadrature weights $\omega_{\vct{j}}$, where $\vct{j}$ is a velocity-space multi-index. Writing $\vct{f}=(f_{\vct{j}})_{\vct{j}}$, the primary kinetic system considered by the numerical method is
+\begin{equation}
+  \frac{\partial f_{\vct{j}}}{\partial t}
+  +\vct{v}_{x,\vct{j}}\cdot\nabla_{\vct{x}}f_{\vct{j}}
+  =\mathcal{Q}_{h,\vct{j}}(\vct{f},\vct{f}),
+  \qquad \text{for every }\vct{j},
+  \label{eq:discrete-velocity-boltzmann}
+\end{equation}
+where $\mathcal{Q}_{h,\vct{j}}$ denotes a consistent discrete Boltzmann collision operator. Although the transport equation is scalar at a fixed $\vct{j}$, Eq.~\eqref{eq:discrete-velocity-boltzmann} remains a nonlinear coupled system because each collision value depends on the complete velocity vector $\vct{f}$. The semi-discrete conservative variables are
+\begin{equation}
+  \vct{W}_h = \sum_{\vct{j}} \omega_{\vct{j}}
+  f_{\vct{j}}\vct{\psi}_{\vct{j}}.
+  \label{eq:discrete-moments}
+\end{equation}
+All macroscopic diagnostics and collision-compatibility corrections are evaluated with the same quadrature. The desired discrete analogue of Eq.~\eqref{eq:compatibility} is
+\begin{equation}
+  \sum_{\vct{j}}\omega_{\vct{j}}
+  \mathcal{Q}_{h,\vct{j}}\vct{\psi}_{\vct{j}}=\vct{0},
+  \label{eq:discrete-collision-compatibility}
+\end{equation}
+which will be enforced by the projection in Section~\ref{sec:collision-conservation}. The active flux construction in Section~\ref{sec:algorithm} is applied directly to Eq.~\eqref{eq:discrete-velocity-boltzmann}; consequently it does not rely on a Maxwellian form of the collision operator.
+
+The BGK model is introduced only as a computationally inexpensive specialization. It replaces the Boltzmann collision integral with relaxation toward the Maxwellian distribution \cite{bhatnagar1954model},
 \begin{equation}
   \frac{\partial f}{\partial t}
-  + v\frac{\partial f}{\partial x}
+  + \vct{v}_x\cdot\nabla_{\vct{x}}f
   = \frac{\mathcal{M}[f]-f}{\tau},
   \label{eq:bgk}
 \end{equation}
-where $\tau$ is the collision time. In the one-dimensional velocity model employed here,
+where $\tau$ is the collision time. In $d_v$ molecular-velocity dimensions,
 \begin{equation}
-  \mathcal{M}(v;\rho,U,\lambda)
-  = \rho\sqrt{\frac{\lambda}{\pi}}
-    \exp\left[-\lambda(v-U)^2\right],
+  \mathcal{M}(\vct{v};\rho,\vct{U},\lambda)
+  = \rho\left(\frac{\lambda}{\pi}\right)^{d_v/2}
+    \exp\left[-\lambda|\vct{v}-\vct{U}|^2\right],
   \label{eq:maxwellian}
 \end{equation}
-with $p=\rho/(2\lambda)$. The current implementation uses a single distribution in one physical and one molecular-velocity dimension, denoted \texttt{1d1f1v}. No reduced internal-energy distribution is introduced; therefore $K=0$ and $\gamma=3$.
-
-The velocity interval is discretized by points $v_j$ and quadrature weights $\omega_j$. The semi-discrete conservative variables are
-\begin{equation}
-  \vct{W}_h = \sum_j \omega_j f_j\vct{\psi}_j.
-  \label{eq:discrete-moments}
-\end{equation}
-All macroscopic diagnostics and the collision compatibility condition are evaluated with the same quadrature.
+with $p=\rho/(2\lambda)$. In the notation of Eq.~\eqref{eq:discrete-velocity-boltzmann}, this specialization amounts to replacing $\mathcal{Q}_{h,\vct{j}}$ by a conservative discrete approximation of $(\mathcal{M}[\vct{f}]-f_{\vct{j}})/\tau$; none of the active flux transport degrees of freedom or reconstructions is changed. The physical dimension $d_x$ and velocity dimension $d_v$ are conceptually independent, and the full Boltzmann formulation normally retains a multidimensional velocity space even for a one-dimensional physical problem. The accuracy programs use a single distribution in one physical and one molecular-velocity dimension, denoted \texttt{1d1f1v}; with no reduced internal-energy distribution, $K=0$ and $\gamma=3$. The Sod and normal-shock calculations instead retain all three molecular-velocity components, denoted \texttt{1d1f3v}, and represent a monatomic gas with $K=0$ and $\gamma=5/3$.
 
 \section{Solution algorithm}
 \label{sec:algorithm}
 
-\subsection{Active flux representation}
+\subsection{Active flux discretization of the discrete-velocity Boltzmann equation}
+\label{sec:active-flux-construction}
 
-Consider a uniform physical mesh with cells $I_i=[x_{i-1/2},x_{i+1/2}]$ and spacing $\Delta x$. For every molecular velocity $v_j$, the active flux degrees of freedom consist of the cell average
+The starting point is the discrete-velocity Boltzmann system in Eq.~\eqref{eq:discrete-velocity-boltzmann}. Its two numerical operations have different structures. Physical transport is diagonal in molecular velocity: for a fixed $\vct{v}_{\vct{j}}$, it is a scalar advection operator with known propagation direction. Collision is local in physical space but couples the complete vector $\vct{f}$. The active flux discretization is therefore constructed in physical space independently for every $\vct{j}$, while every collision call receives all velocity components at the same physical location. This separation is the reason the same active flux representation can be combined with a fast spectral Boltzmann operator, a direct collision discretization, or the BGK specialization without changing its transport stencil.
+
+\subsubsection{Degrees of freedom and continuous reconstruction}
+
+Let $K$ be a physical cell with measure $|K|$, boundary $\partial K$, and a prescribed set of boundary nodes $\mathcal{S}(K)$. For every discrete molecular velocity, active flux retains two types of unknown,
+\begin{equation}
+  \avg{f}_{K,\vct{j}}(t)
+  =\frac{1}{|K|}\int_K f(t,\vct{x},\vct{v}_{\vct{j}})\dd\vct{x},
+  \qquad
+  f_{\sigma,\vct{j}}(t)
+  \approx f(t,\vct{x}_{\sigma},\vct{v}_{\vct{j}}),
+  \quad \sigma\in\mathcal{S}(K).
+  \label{eq:active-flux-dofs}
+\end{equation}
+The first quantity is conservative and belongs to one cell. A boundary value is stored only once and is shared by all cells meeting at $\vct{x}_{\sigma}$. For cell $K$, these data define a polynomial $p_{K,\vct{j}}=\mathcal{R}_K(\avg{f}_{K,\vct{j}},\{f_{\sigma,\vct{j}}\})$ satisfying
+\begin{equation}
+  \frac{1}{|K|}\int_K p_{K,\vct{j}}(\vct{x})\dd\vct{x}
+  =\avg{f}_{K,\vct{j}},
+  \qquad
+  p_{K,\vct{j}}(\vct{x}_{\sigma})=f_{\sigma,\vct{j}}
+  \quad\text{for }\sigma\in\mathcal{S}(K).
+  \label{eq:active-flux-reconstruction-conditions}
+\end{equation}
+The boundary nodes are chosen so that neighboring reconstructions have the same trace on their common face. Hence $p_{h,\vct{j}}$ is continuous across the physical mesh, although its normal derivative can be discontinuous. This differs from a standard finite-volume reconstruction: the interface trace is an independently evolved degree of freedom rather than two extrapolated states. Consequently the kinetic flux is obtained directly from one shared distribution value; a Riemann solver is neither required nor introduced.
+
+At $t=0$, cell averages are initialized by physical-space quadrature of $f_0(\vct{x},\vct{v}_{\vct{j}})$, whereas boundary values are sampled directly at $\vct{x}_{\sigma}$. All molecular velocities use the same physical nodes. It is therefore useful to regard the reconstructed state at one physical point as the vector
+\begin{equation}
+  \vct{p}_K(\vct{x})
+  =\left(p_{K,\vct{j}}(\vct{x})\right)_{\vct{j}}.
+  \label{eq:reconstructed-velocity-vector}
+\end{equation}
+Transport accesses its components separately, while the Boltzmann collision routine evaluates $\mathcal{Q}_h(\vct{p}_K,\vct{p}_K)$ as a coupled velocity-space operation.
+
+\subsubsection{Boundary evolution, kinetic flux, and cell balance}
+
+The boundary values must be evolved in addition to the cell averages. At a shared node $\sigma$, the transport derivative is taken from the cell lying upstream with respect to $\vct{v}_{x,\vct{j}}$. Denoting this one-sided derivative by $\vct{D}^{\mathrm{up}}_{\sigma,\vct{j}}$, the unsplit point-value equation is
+\begin{equation}
+  \frac{\dd f_{\sigma,\vct{j}}}{\dd t}
+  =-\vct{v}_{x,\vct{j}}\cdot
+    \vct{D}^{\mathrm{up}}_{\sigma,\vct{j}}
+  +\mathcal{Q}_{h,\vct{j}}
+   (\vct{f}_{\sigma},\vct{f}_{\sigma}),
+  \qquad
+  \vct{f}_{\sigma}=(f_{\sigma,\vct{j}})_{\vct{j}}.
+  \label{eq:general-point-evolution}
+\end{equation}
+The first term is scalar and upwind at each velocity; the second term couples the velocity vector but remains local to the node. In a characteristic split formulation, the transport part is evaluated by tracing $\vct{x}_{\sigma}-s\vct{v}_{x,\vct{j}}$ into the upwind reconstruction, and collision is advanced by a separate local map. In the method-of-lines formulation, both terms in Eq.~\eqref{eq:general-point-evolution} enter the same additive right-hand side or the two components of an implicit--explicit problem. These are temporal choices applied to the same active flux spatial data.
+
+For an oriented face $e\subset\partial K$ with outward normal $\vct{n}_{K,e}$, evolved boundary values determine the time- and face-averaged kinetic flux
+\begin{equation}
+  \widehat{\mathcal{F}}_{K,e,\vct{j}}
+  =\frac{1}{\Delta t\,|e|}
+   \int_0^{\Delta t}\int_e
+   \left(\vct{v}_{x,\vct{j}}\cdot\vct{n}_{K,e}\right)
+   f_{\partial,\vct{j}}(t^n+s,\vct{x})
+   \dd s_e\dd s.
+  \label{eq:general-space-time-flux}
+\end{equation}
+Here $f_{\partial,\vct{j}}$ is the continuous boundary trace assembled from the evolved active flux nodes. The same value is used with opposite normals by the two neighboring cells, so cancellation of interior face contributions is exact.
+
+The nonlinear collision source of a cell average must be averaged after reconstructing the distribution, not formed by applying $\mathcal{Q}_h$ directly to $\avg{\vct{f}}_K$. Formally, its space--time average is
+\begin{equation}
+  \widehat{\mathcal{Q}}_{K,\vct{j}}
+  =\frac{1}{\Delta t\,|K|}
+   \int_0^{\Delta t}\int_K
+   \mathcal{Q}_{h,\vct{j}}
+   (\vct{p}_K(t^n+s,\vct{x}),
+    \vct{p}_K(t^n+s,\vct{x}))
+   \dd\vct{x}\dd s.
+  \label{eq:cell-averaged-collision}
+\end{equation}
+Physical-space Gaussian quadrature and the selected temporal integrator approximate this expression. Combining transport and collision gives the conservative cell update
+\begin{equation}
+  \avg{f}_{K,\vct{j}}^{,n+1}
+  =\avg{f}_{K,\vct{j}}^{,n}
+  -\frac{\Delta t}{|K|}
+   \sum_{e\subset\partial K}|e|
+   \widehat{\mathcal{F}}_{K,e,\vct{j}}
+  +\Delta t\widehat{\mathcal{Q}}_{K,\vct{j}}.
+  \label{eq:general-active-flux-update}
+\end{equation}
+Global conservation follows by summing Eq.~\eqref{eq:general-active-flux-update} over physical cells and then taking the discrete velocity moments: internal transport fluxes cancel pairwise, and the projected Boltzmann collision term has zero invariant moments by Eq.~\eqref{eq:discrete-collision-compatibility}. The BGK model changes only the evaluation of $\widehat{\mathcal{Q}}_{K,\vct{j}}$.
+
+\subsubsection{Complete solution procedure}
+
+One time step of the general method consists of the following operations.
+\begin{enumerate}
+  \item Discretize molecular velocity and prepare the collision backend. For the target Boltzmann solver this includes the fast spectral convolution data and invariant projection; selecting BGK replaces only this backend.
+  \item Initialize or retrieve the cell-average and shared-boundary vectors for all $\vct{j}$, and impose the incoming part of each physical boundary condition according to the sign of $\vct{v}_{x,\vct{j}}\cdot\vct{n}$.
+  \item Construct $p_{K,\vct{j}}$ in every physical cell and, when collision is evaluated, assemble the full vector $\vct{p}_K$ at every physical-space quadrature point.
+  \item Evolve every shared boundary value from the upwind reconstruction. The characteristic path evaluates the foot of the molecular trajectory; the method-of-lines path evaluates the one-sided derivative in Eq.~\eqref{eq:general-point-evolution} at every Runge--Kutta stage.
+  \item Integrate the evolved boundary trace in time and along each face to obtain Eq.~\eqref{eq:general-space-time-flux}. In one dimension this time integral is analytic for the quadratic reconstruction; in two dimensions the face and time integrals use tensor Simpson quadrature.
+  \item Evaluate the collision operator on each reconstructed velocity vector, enforce its discrete invariant moments, and integrate the result in physical space. A split method advances these local collision problems before and after transport; an unsplit method adds their stage derivatives to the transport right-hand side.
+  \item Update all cell averages by the conservative balance in Eq.~\eqref{eq:general-active-flux-update} and retain the independently evolved boundary values as the second set of solution unknowns.
+  \item Apply the positivity or shock limiter when required, refresh boundary ghosts, and compute macroscopic variables with the same velocity quadrature as Eq.~\eqref{eq:discrete-moments}.
+\end{enumerate}
+This sequence exposes precisely which components are universal and which are model dependent. The active flux reconstruction, point transport, and conservative face balance depend only on $\vct{v}_{x,\vct{j}}$. The collision backend, its conservation correction, and its stiff temporal treatment contain the distinction between the Boltzmann equation and BGK.
+
+\subsubsection{One-dimensional quadratic realization}
+
+Consider now a uniform one-dimensional mesh with cells $I_i=[x_{i-1/2},x_{i+1/2}]$ and spacing $\Delta x$. For every molecular velocity $v_j$, Eq.~\eqref{eq:active-flux-dofs} reduces to the cell average
 \begin{equation}
   \avg{f}_{i,j}(t)
   = \frac{1}{\Delta x}\int_{I_i} f(t,x,v_j)\dd x
@@ -146,16 +286,53 @@ and the shared interface values $f_{i-1/2,j}$ and $f_{i+1/2,j}$. On the local co
   &+(3\xi^2-2\xi)f_{i+1/2,j}.
   \label{eq:quadratic-reconstruction}
 \end{align}
-The reconstruction interpolates both boundary values and has the prescribed cell average. Since an interface value is shared by adjacent cells, the total reconstruction is continuous even though its derivative is generally discontinuous.
+Direct substitution gives $p_{i,j}(0)=f_{i-1/2,j}$, $p_{i,j}(1)=f_{i+1/2,j}$, and $\int_0^1p_{i,j}(\xi)\dd\xi=\avg{f}_{i,j}$. Thus it satisfies both conditions in Eq.~\eqref{eq:active-flux-reconstruction-conditions}. Since each interface value is shared by adjacent cells, the global reconstruction is continuous even though its derivative is generally discontinuous. The two one-sided derivatives of this polynomial supply the kinetic upwind derivative in the semi-discrete point equation, while its values along molecular characteristics provide the fully discrete update derived in Section~\ref{sec:characteristic-transport}.
+
+\subsection{Two-dimensional Cartesian representation}
+
+On a rectangular cell $C_{i,k}$, the active flux degrees of freedom at a fixed molecular velocity consist of the cell average and eight boundary point values: four values at the vertices and four at the edge midpoints. These point values are shared by every adjacent cell that contains the corresponding boundary location. This is the Cartesian active flux arrangement introduced for multidimensional systems in Ref.~\cite{barsukow2019cartesian}.
+
+Let $(\xi,\eta)\in[0,1]^2$ be the reference coordinates and introduce the quadratic nodal functions
+\begin{equation}
+  \ell_0(s)=2s^2-3s+1,
+  \qquad
+  \ell_1(s)=4s(1-s),
+  \qquad
+  \ell_2(s)=2s^2-s.
+  \label{eq:quadratic-nodal-basis}
+\end{equation}
+The boundary values are denoted by $f_{ab,\vct{j}}$ at the tensor nodes $(a/2,b/2)$, where $a,b\in\{0,1,2\}$ and $(a,b)\ne(1,1)$. The biparabolic reconstruction is
+\begin{equation}
+  p_{i,k,\vct{j}}(\xi,\eta)
+  =\sum_{a=0}^{2}\sum_{b=0}^{2}
+  f_{ab,\vct{j}}\ell_a(\xi)\ell_b(\eta),
+  \label{eq:biparabolic-reconstruction}
+\end{equation}
+where the auxiliary center coefficient is determined by the cell average,
+\begin{equation}
+  f_{11,\vct{j}}
+  =\frac{1}{m_1^2}
+  \left[
+  \avg{f}_{i,k,\vct{j}}
+  -\mathop{\sum_{a=0}^{2}\sum_{b=0}^{2}}_{(a,b)\ne(1,1)}
+  m_am_bf_{ab,\vct{j}}
+  \right],
+  \qquad
+  (m_0,m_1,m_2)=\left(\frac16,\frac23,\frac16\right).
+  \label{eq:biparabolic-center}
+\end{equation}
+The weights $m_a=\int_0^1\ell_a(s)\dd s$ make the cell average of Eq.~\eqref{eq:biparabolic-reconstruction} equal to $\avg{f}_{i,k,\vct{j}}$. On a common edge, the reconstructions from the two neighboring cells reduce to quadratic polynomials that interpolate the same two vertices and midpoint. They therefore coincide along the complete edge, yielding a globally continuous reconstruction.
 
 \subsection{Characteristic transport}
+\label{sec:characteristic-transport}
 
 During a collisionless substep, every velocity component satisfies
 \begin{equation}
-  \partial_t f_j + v_j\partial_x f_j = 0.
+  \partial_t f_{\vct{j}}
+  +\vct{v}_{x,\vct{j}}\cdot\nabla_{\vct{x}}f_{\vct{j}}=0.
   \label{eq:transport}
 \end{equation}
-The exact characteristic solution is $f_j(t+\Delta t,x)=f_j(t,x-v_j\Delta t)$. For $v_j>0$, the characteristic arriving at $x_{i+1/2}$ originates from cell $i$. Let
+The exact characteristic solution is $f_{\vct{j}}(t+\Delta t,\vct{x})=f_{\vct{j}}(t,\vct{x}-\vct{v}_{x,\vct{j}}\Delta t)$. In one dimension, for $v_j>0$, the characteristic arriving at $x_{i+1/2}$ originates from cell $i$. Let
 \begin{equation}
   c_j = \frac{|v_j|\Delta t}{\Delta x},
   \qquad 0\le c_j\le 1.
@@ -188,9 +365,93 @@ For $v_j<0$, the same construction is reflected and uses cell $i+1$. The cell av
 \end{equation}
 Equations~\eqref{eq:point-update-positive}--\eqref{eq:conservative-update} constitute a one-step, third-order active flux transport operator. The molecular velocity supplies the upwind direction directly, so no approximate Riemann solver is needed.
 
-\subsection{BGK relaxation and operator splitting}
+In two dimensions, the same characteristic construction is applied to every vertex and edge midpoint. For a boundary point $\vct{x}_{e,r}$, temporal nodes $\vartheta_q\in\{0,1/2,1\}$, and the cell $C(e,r,\vct{j},q)$ containing the characteristic foot, the evolved point value is
+\begin{equation}
+  f_{e,r,\vct{j}}^{n+\vartheta_q}
+  =p_{C(e,r,\vct{j},q),\vct{j}}^n
+  \left(\vct{x}_{e,r}-\vartheta_q\Delta t\vct{v}_{x,\vct{j}}\right).
+  \label{eq:two-dimensional-point-update}
+\end{equation}
+The edge nodes $r=0,1,2$ are the two vertices and midpoint. With Simpson weights $\sigma=(1,4,1)/6$, the space--time average of the interface distribution is
+\begin{equation}
+  \widehat{f}_{e,\vct{j}}
+  =\sum_{q=0}^{2}\sum_{r=0}^{2}
+  \sigma_q\sigma_r f_{e,r,\vct{j}}^{n+\vartheta_q}.
+  \label{eq:space-time-simpson}
+\end{equation}
+The conservative update of the cell average becomes
+\begin{equation}
+  \avg{f}_{C,\vct{j}}^{n+1}
+  =\avg{f}_{C,\vct{j}}^{n}
+  -\frac{\Delta t}{|C|}
+  \sum_{e\subset\partial C}|e|
+  \left(\vct{v}_{x,\vct{j}}\cdot\vct{n}_e\right)
+  \widehat{f}_{e,\vct{j}}.
+  \label{eq:two-dimensional-conservative-update}
+\end{equation}
+The tensor Simpson rule is third-order accurate in space and time for the evolved boundary data \cite{barsukow2019cartesian}. A compact nearest-neighbor evolution is obtained under the sufficient restriction $|v_{1,\vct{j}}|\Delta t\le\Delta x/2$ and $|v_{2,\vct{j}}|\Delta t\le\Delta y/2$; a larger displacement can instead be handled by locating the characteristic foot in a wider stencil.
 
-The transport and collision operators are denoted by $\mathcal{T}$ and $\mathcal{C}$, respectively. A second-order Strang sequence advances the coupled equation \cite{strang1968construction},
+\subsection{Semi-discrete formulation and Runge--Kutta integration}
+\label{sec:semidiscrete}
+
+The characteristic formulas above define a compact fully discrete transport operator. A second formulation is useful when the temporal method should be selected independently of the physical-space discretization. Collect the cell averages and shared boundary point values at every molecular velocity into one vector $\vct{F}_h$. After velocity and physical-space discretization, the kinetic equation is written in method-of-lines form,
+\begin{equation}
+  \frac{\dd\vct{F}_h}{\dd t}
+  =\mathcal{R}_h(\vct{F}_h)
+  =\mathcal{T}_h(\vct{F}_h)
+  +\frac{1}{\varepsilon}\mathcal{C}_h(\vct{F}_h),
+  \label{eq:semidiscrete-system}
+\end{equation}
+where $\varepsilon$ is proportional to the Knudsen number. The transport operator is independent of $\varepsilon$. In the general formulation, $\mathcal{C}_h$ is the conservative normalized Boltzmann collision operator; replacing it by BGK relaxation gives the simplified model without modifying $\mathcal{T}_h$ or the active flux state.
+
+In one dimension, the cell-average component remains a conservative flux difference,
+\begin{equation}
+  \frac{\dd\avg{f}_{i,j}}{\dd t}
+  =-\frac{v_j}{\Delta x}
+  \left(f_{i+1/2,j}-f_{i-1/2,j}\right)
+  +\frac{1}{\varepsilon}\avg{\mathcal{C}}_{i,j}.
+  \label{eq:semidiscrete-cell-average}
+\end{equation}
+The point-value transport derivative follows directly from the one-sided derivative of the continuous quadratic reconstruction. At $x_{i+1/2}$,
+\begin{equation}
+  \frac{\dd f_{i+1/2,j}}{\dd t}
+  =-v_jD_{i+1/2,j}^{\mathrm{up}}
+  +\frac{1}{\varepsilon}\mathcal{C}_{i+1/2,j},
+  \label{eq:semidiscrete-point-value}
+\end{equation}
+with
+\begin{equation}
+  D_{i+1/2,j}^{\mathrm{up}}
+  =\begin{cases}
+  \displaystyle
+  \frac{2f_{i-1/2,j}-6\avg{f}_{i,j}+4f_{i+1/2,j}}{\Delta x},
+  & v_j\ge0,\\[2ex]
+  \displaystyle
+  \frac{-4f_{i+1/2,j}+6\avg{f}_{i+1,j}-2f_{i+3/2,j}}{\Delta x},
+  & v_j<0.
+  \end{cases}
+  \label{eq:semidiscrete-upwind-derivative}
+\end{equation}
+Equations~\eqref{eq:semidiscrete-cell-average}--\eqref{eq:semidiscrete-upwind-derivative} define the same active flux degrees of freedom as the characteristic update, but contain no time-step-dependent coefficient. The two-dimensional counterpart evaluates the normal derivative of the upwind biparabolic reconstruction at every boundary node and retains the conservative edge quadrature in the cell-average component.
+
+For a non-stiff calculation, an $s$-stage explicit Runge--Kutta method can now be applied without changing the spatial operator,
+\begin{align}
+  \vct{F}^{(k)}
+  & =\vct{F}^{n}
+  +\Delta t\sum_{\ell=1}^{k-1}a_{k\ell}
+  \mathcal{R}_h\left(\vct{F}^{(\ell)}\right),
+  \label{eq:explicit-rk-stage}\\
+  \vct{F}^{n+1}
+  & =\vct{F}^{n}
+  +\Delta t\sum_{k=1}^{s}b_k
+  \mathcal{R}_h\left(\vct{F}^{(k)}\right).
+  \label{eq:explicit-rk-update}
+\end{align}
+The Julia implementation stores $\vct{F}_h$ as a dense velocity-by-degree-of-freedom array and provides in-place functions with the signature \texttt{rhs!(dF,F,p,t)}. The combined operator is supplied to an \texttt{ODEProblem}; alternatively, collision and transport are supplied separately to a \texttt{SplitODEProblem}. This interface allows, for example, an adaptive explicit Runge--Kutta method for rarefied flow and a stiffly accurate implicit--explicit method for small $\varepsilon$, while enforcing a common molecular transport CFL bound.
+
+\subsection{Boltzmann collision evolution and BGK specialization}
+
+The method-of-lines equations advance transport and collision through one additive or partitioned right-hand side. A complementary characteristic implementation composes a transport map $\mathcal{T}$ with a local collision map $\mathcal{C}$. The spatial-convergence programs retain this characteristic path with exact BGK relaxation, while the Sod driver places an OrdinaryDiffEq Runge--Kutta transport solve between two successive-penalty full-Boltzmann collision half steps. In this composed path, a second-order Strang sequence has the form \cite{strang1968construction}
 \begin{equation}
   f^{n+1}
   = \mathcal{C}_{\Delta t/2}
@@ -198,7 +459,15 @@ The transport and collision operators are denoted by $\mathcal{T}$ and $\mathcal
     \mathcal{C}_{\Delta t/2}f^n.
   \label{eq:strang}
 \end{equation}
-During a collision-only substep, the conservative moments, Maxwellian, and collision time are constant. The exact local solution is therefore
+For the full Boltzmann equation, which remains the target model, $\mathcal{C}_{\delta t}$ advances the spatially homogeneous system
+\begin{equation}
+  \frac{\partial f_{\vct{j}}}{\partial t}
+  =\mathcal{Q}_{h,\vct{j}}(f,f),
+  \label{eq:homogeneous-boltzmann}
+\end{equation}
+independently at every physical-space evaluation point. The target implementation evaluates $\mathcal{Q}_h$ with a fast spectral method, which reduces the cost of the velocity-space convolution while retaining spectral resolution of a general collision kernel \cite{mouhot2006fast,xiao2021flux}. An explicit collision integrator is sufficient in rarefied regimes; an ESDIRK or penalized implicit--explicit treatment is required when the collision term becomes stiff. This collision module is independent of whether the physical mesh is one- or two-dimensional.
+
+For the BGK specialization, the conservative moments, Maxwellian, and collision time remain constant during a collision-only substep. The local solution is therefore available exactly,
 \begin{equation}
   f(t+\delta t)
   = \mathcal{M}
@@ -206,36 +475,142 @@ During a collision-only substep, the conservative moments, Maxwellian, and colli
   \label{eq:exact-relaxation}
 \end{equation}
 
-For a nonlinear relaxation operator, applying Eq.~\eqref{eq:exact-relaxation} directly to $\avg{f}_i$ would approximate the cell average of $\mathcal{M}[f]$ only to second order in space. The current scheme instead evaluates Eq.~\eqref{eq:quadratic-reconstruction} at four Gauss--Legendre points, relaxes each point distribution by Eq.~\eqref{eq:exact-relaxation}, and integrates the relaxed values back to the cell average. Interface distributions are relaxed pointwise after all cell reconstructions have been processed. This ordering ensures that every cell uses old-time interface data.
+For either collision model, applying the collision map directly to $\avg{f}_i$ would not approximate the cell average of the nonlinear collision term to the design order. The reconstructed distribution is instead evaluated at physical-space Gauss--Legendre points, the collision problem is advanced independently at every point, and the evolved distributions are integrated back to the cell average. Four Gauss points are used in each one-dimensional verification cell. The two-dimensional formulation uses the corresponding tensor-product quadrature of Eq.~\eqref{eq:biparabolic-reconstruction}. Boundary point distributions are collided pointwise after all cell reconstructions have been processed. This ordering ensures that every cell uses a common old-time boundary state.
 
-\subsection{Discrete conservative Maxwellian}
+\subsection{Discrete collision conservation}
+\label{sec:collision-conservation}
 
-On a finite velocity interval, quadrature of the analytic Maxwellian in Eq.~\eqref{eq:maxwellian} introduces a small moment defect. Repeated relaxation toward this function would cause the discrete collision invariants to drift. Let
+Velocity truncation and spectral evaluation can leave a small compatibility defect in the raw Boltzmann collision vector $\mathcal{Q}_{h,\vct{j}}^*$. Define
+\begin{equation}
+  \vct{d}_{\mathcal{Q}}
+  =\sum_{\vct{j}}\omega_{\vct{j}}
+  \mathcal{Q}_{h,\vct{j}}^*\vct{\psi}_{\vct{j}}.
+  \label{eq:collision-defect}
+\end{equation}
+A minimum-dimensional moment projection is
+\begin{equation}
+  \mathcal{Q}_{h,\vct{j}}^c
+  =\mathcal{Q}_{h,\vct{j}}^*
+  -\vct{\alpha}_{\mathcal{Q}}^T\vct{\psi}_{\vct{j}},
+  \qquad
+  \vct{G}_{\mathcal{Q}}\vct{\alpha}_{\mathcal{Q}}
+  =\vct{d}_{\mathcal{Q}},
+  \qquad
+  \vct{G}_{\mathcal{Q}}
+  =\sum_{\vct{j}}\omega_{\vct{j}}
+  \vct{\psi}_{\vct{j}}\vct{\psi}_{\vct{j}}^T.
+  \label{eq:collision-projection}
+\end{equation}
+It follows directly that $\sum_{\vct{j}}\omega_{\vct{j}}\mathcal{Q}_{h,\vct{j}}^c\vct{\psi}_{\vct{j}}=\vct{0}$. The correction acts only in velocity space and can therefore be applied identically at all one- and two-dimensional physical-space quadrature points.
+
+For the BGK model, conservation is imposed by correcting the discrete Maxwellian rather than the collision vector. On a finite velocity interval, quadrature of the analytic Maxwellian in Eq.~\eqref{eq:maxwellian} introduces a small moment defect. Repeated relaxation toward this function would cause the discrete collision invariants to drift. Let
 \begin{equation}
   \vct{d}
   = \vct{W}_h
-  -\sum_j\omega_j\mathcal{M}_j\vct{\psi}_j.
+  -\sum_{\vct{j}}\omega_{\vct{j}}
+  \mathcal{M}_{\vct{j}}\vct{\psi}_{\vct{j}}.
   \label{eq:moment-defect}
 \end{equation}
 A corrected equilibrium is defined by
 \begin{equation}
-  \mathcal{M}_{d,j}
-  = \mathcal{M}_j\left(1+\vct{\alpha}^{T}\vct{\psi}_j\right).
+  \mathcal{M}_{d,\vct{j}}
+  = \mathcal{M}_{\vct{j}}
+  \left(1+\vct{\alpha}^{T}\vct{\psi}_{\vct{j}}\right).
   \label{eq:discrete-maxwellian}
 \end{equation}
-The correction coefficients follow from the $3\times3$ system
+The correction coefficients follow from a $(d_v+2)\times(d_v+2)$ system, which reduces to $3\times3$ in the present \texttt{1d1f1v} tests,
 \begin{equation}
   \vct{G}\vct{\alpha}=\vct{d},
   \qquad
-  \vct{G}=\sum_j\omega_j\mathcal{M}_j
-  \vct{\psi}_j\vct{\psi}_j^{T}.
+  \vct{G}=\sum_{\vct{j}}\omega_{\vct{j}}\mathcal{M}_{\vct{j}}
+  \vct{\psi}_{\vct{j}}\vct{\psi}_{\vct{j}}^{T}.
   \label{eq:moment-correction}
 \end{equation}
 Substitution into Eq.~\eqref{eq:discrete-moments} shows that $\mathcal{M}_d$ reproduces $\vct{W}_h$ exactly up to the linear-solver tolerance. The correction is small when the velocity interval resolves the tails of the distribution. In the numerical experiments it reduces the global collision-invariant drift from approximately $10^{-11}$ to $10^{-13}$ or below.
 
+\subsection{Hydrodynamic limit and asymptotic-preserving design}
+\label{sec:ap-analysis}
+
+An asymptotic-preserving (AP) discretization must remain stable when $\varepsilon\ll1$ without resolving the collision time and, at fixed $\Delta x$ and $\Delta t$, must reduce to a consistent discretization of the limiting macroscopic equations as $\varepsilon\to0$ \cite{filbet2010ap,dimarco2013imex}. These two requirements distinguish AP behavior from collision stability alone. Applying an explicit Runge--Kutta method to Eq.~\eqref{eq:semidiscrete-system} generally imposes $\Delta t=O(\varepsilon)$. Exact BGK relaxation or penalized Boltzmann collision can remove that stability restriction, but a single Filbet--Jin penalty step has only a well-prepared, or weak, AP property. The successive-penalty map used below restores a strong homogeneous relaxation limit for non-equilibrium input \cite{yan2013successive}. Its composition with shock-limited transport still does not by itself establish uniform accuracy of the complete spatial--temporal scheme. The equilibrium-null-space argument is collision-model independent: both the Boltzmann and BGK operators share the Maxwellian equilibrium manifold. We first state the algebraic conditions for a general $\mathcal{C}_h$, use BGK to exhibit them transparently, and then return to the penalized full Boltzmann construction.
+
+For the method-of-lines system, consider an implicit--explicit Runge--Kutta discretization in which transport is explicit and collision is implicit,
+\begin{equation}
+  \vct{F}^{(k)}
+  =\vct{F}^{n}
+  +\Delta t\sum_{\ell=1}^{k-1}a^{E}_{k\ell}
+     \mathcal{T}_h\left(\vct{F}^{(\ell)}\right)
+  +\frac{\Delta t}{\varepsilon}
+   \sum_{\ell=1}^{k}a^{I}_{k\ell}
+     \mathcal{C}_h\left(\vct{F}^{(\ell)}\right).
+  \label{eq:imex-stage}
+\end{equation}
+Let $\mathcal{P}_h$ denote the discrete velocity-moment map in Eq.~\eqref{eq:discrete-moments}. The collision construction must satisfy
+\begin{equation}
+  \mathcal{P}_h\mathcal{C}_h(\vct{F})=\vct{0},
+  \qquad
+  \mathcal{C}_h(\vct{F})=\vct{0}
+  \Longleftrightarrow
+  \vct{F}=\mathcal{E}_h(\vct{W}),
+  \quad \vct{W}=\mathcal{P}_h\vct{F},
+  \label{eq:discrete-equilibrium-nullspace}
+\end{equation}
+where $\mathcal{E}_h$ is a discrete equilibrium map. For the BGK model, the AP-oriented implementation uses the degree-of-freedom projection
+\begin{equation}
+  \mathcal{C}_{h,a}^{\mathrm{eq}}(\vct{F})
+  =\frac{
+  \mathcal{M}_d[\mathcal{P}_h\vct{F}_a]-\vct{F}_a}
+  {\widehat{\tau}_a},
+  \label{eq:equilibrium-projection-collision}
+\end{equation}
+for every cell-average or boundary-point degree of freedom $a$, with $\tau_a=\varepsilon\widehat{\tau}_a$. The corrected Maxwellian in Eq.~\eqref{eq:discrete-maxwellian} makes both identities in Eq.~\eqref{eq:discrete-equilibrium-nullspace} hold under the numerical velocity quadrature.
+
+Assume that the implicit tableau has nonzero diagonal entries and that the additive method is globally stiffly accurate. For well-prepared data, taking $\varepsilon\to0$ in Eq.~\eqref{eq:imex-stage} at fixed discretization forces
+\begin{equation}
+  \vct{F}^{(k)}
+  =\mathcal{E}_h\left(\vct{W}^{(k)}\right).
+  \label{eq:imex-equilibrium-stage}
+\end{equation}
+Application of $\mathcal{P}_h$ eliminates every implicit collision term and gives
+\begin{equation}
+  \vct{W}^{(k)}
+  =\vct{W}^{n}
+  +\Delta t\sum_{\ell=1}^{k-1}a^{E}_{k\ell}
+  \mathcal{P}_h\mathcal{T}_h
+  \left(\mathcal{E}_h(\vct{W}^{(\ell)})\right).
+  \label{eq:imex-euler-limit}
+\end{equation}
+This is an explicit Runge--Kutta discretization of the equilibrium kinetic flux, and hence a consistent kinetic flux-vector-splitting approximation of the compressible Euler limit. Its stability step is controlled by molecular transport rather than by $\varepsilon$. Equations~\eqref{eq:imex-equilibrium-stage} and \eqref{eq:imex-euler-limit} establish the formal Euler-limit AP property of the equilibrium-projection option when it is paired with a suitable stiffly accurate implicit--explicit method.
+
+There remains an important accuracy distinction. The physical-space quadrature collision in the legacy solver approximates the cell average of the nonlinear source to high order at finite Knudsen number, but reconstructing a distribution and applying a nonlinear equilibrium map do not commute. Its discrete null space is therefore not exactly Eq.~\eqref{eq:discrete-equilibrium-nullspace} at fixed $\Delta x$. Conversely, the degree-of-freedom projection in Eq.~\eqref{eq:equilibrium-projection-collision} supplies the exact equilibrium manifold needed for the AP limit, but is not yet a uniformly high-order approximation of the finite-$\varepsilon$ cell-averaged source. A macro--micro reconstruction of the form
+\begin{equation}
+  f_h=\mathcal{M}_d[\vct{W}_h]+\varepsilon g_h,
+  \qquad \mathcal{P}_h g_h=\vct{0},
+  \label{eq:macro-micro-reconstruction}
+\end{equation}
+is the planned route to combine design-order kinetic accuracy, an exact discrete equilibrium manifold, and uniform accuracy in $\varepsilon$.
+
+For the full Boltzmann operator, a direct nonlinear implicit solve at every physical quadrature point is prohibitively expensive. A standard AP construction introduces a BGK penalty \cite{filbet2010ap,dimarco2013imex},
+\begin{equation}
+  \mathcal{Q}_h(f,f)
+  =\left[\mathcal{Q}_h(f,f)
+    -\mu\left(\mathcal{M}_d[f]-f\right)\right]
+   +\mu\left(\mathcal{M}_d[f]-f\right),
+  \label{eq:boltzmann-penalization}
+\end{equation}
+where the bracketed residual is explicit and the BGK penalty is implicit. The conservative projection in Eq.~\eqref{eq:collision-projection} must be applied before the split so that both the residual and penalty have compatible moments. A single implicit penalty denominator remains bounded but does not strongly project general non-equilibrium input onto the Maxwellian as $\varepsilon\to0$. The Sod implementation therefore uses two successive implicit BGK penalty stages \cite{yan2013successive}. With $\lambda^n=\delta t/\tau^n$, a fixed $0<\alpha<1$, and $\mathcal{M}_d^n$ determined by the collision invariants, eliminating those two stages gives
+\begin{equation}
+  f^{n+1}-\mathcal{M}_d^n
+  =\frac{(1+\lambda^n)(f^n-\mathcal{M}_d^n)
+  +\delta t\,\mathcal{Q}_h(f^n,f^n)}
+  {(1+\alpha\lambda^n)
+   [1+(1-\alpha)\lambda^n]},
+  \label{eq:sod-penalized-collision}
+\end{equation}
+where $\alpha=1/2$ is used below. For $\lambda^n\ll1$, Eq.~\eqref{eq:sod-penalized-collision} reduces to $f^{n+1}=f^n+\delta t\,\mathcal{Q}_h(f^n,f^n)+O(\delta t^2)$. For $\lambda^n\to\infty$, its numerator is linear and its denominator quadratic in $\lambda^n$, so $f^{n+1}-\mathcal{M}_d^n=O(1/\lambda^n)$ even for non-well-prepared input. The complete conservative FSM value is evaluated once at every collision call, and a subsequent positive exponential projection preserves the same five discrete moments. Uniform accuracy of the Strang-composed active flux method remains to be verified separately.
+
 \subsection{Discontinuities, positivity, and boundaries}
 
-The unlimited quadratic reconstruction is not suitable near a shock. For each velocity component, a normalized kinetic jump is evaluated at an interface,
+The unlimited quadratic reconstruction is not suitable near an under-resolved shock. In one dimension, for each velocity component, a normalized kinetic jump is evaluated at an interface,
 \begin{equation}
   s_{i+1/2,j}
   = \frac{|\avg{f}_{i+1,j}-\avg{f}_{i,j}|}
@@ -253,22 +628,30 @@ The high-order active flux point value and time average are blended with their f
 \end{equation}
 Thus, the active flux update is retained in smooth regions and transitions continuously to kinetic upwinding at a strong jump. The first-order cell-average candidate is positive under Eq.~\eqref{eq:cfl}. If an antidiffusive correction would produce a negative cell average, the correction is scaled conservatively toward that positive candidate. Negative interface point values are projected to zero; this operation does not modify the finite-volume balance because point values are additional, nonconservative degrees of freedom. The collision reconstruction is contracted toward its positive cell average whenever a Gauss-point value is negative, following the same convex-limiting principle used in positivity-preserving high-order methods \cite{hu2013positivity,kiechle2025positivity}.
 
-Periodic boundaries are imposed by copying cell and interface ghosts. For the shock tube, fixed Maxwellian reservoirs are prescribed only on incoming characteristics: $v_j>0$ at the left boundary and $v_j<0$ at the right boundary. Outgoing half ranges are evolved from the interior, which avoids artificial reflection before the waves reach the domain boundary.
+On a two-dimensional face, the same sensor is formed from the two adjacent cell averages and the blending is applied to all three face point values. The first-order reference state is selected by the sign of $\vct{v}_{x,\vct{j}}\cdot\vct{n}_e$. This face-normal construction reduces exactly to Eqs.~\eqref{eq:jump-sensor}--\eqref{eq:shock-blend} in one dimension; a multidimensional bound-preserving proof and numerical assessment remain necessary for the complete two-dimensional implementation.
 
-The complete time step can be summarized as follows:
+Periodic boundaries are imposed by copying cell and boundary-point ghosts. At an open boundary with outward normal $\vct{n}$, a prescribed reservoir is used only for incoming characteristics satisfying $\vct{v}_x\cdot\vct{n}<0$; outgoing values are evolved from the interior. In the one-dimensional shock tube, this condition gives $v_j>0$ at the left boundary and $v_j<0$ at the right boundary.
+
+The implementation exposes two time-integration paths. The characteristic--Strang path retained by the spatial-convergence programs is summarized as follows:
 \begin{enumerate}
-  \item reconstruct the old-time distribution at four physical-space Gauss points;
-  \item apply a half BGK relaxation step to cell and interface distributions;
-  \item evolve all interface point values along molecular characteristics and compute their exact time averages;
-  \item update cell averages with the conservative kinetic flux difference;
-  \item repeat the reconstructed BGK relaxation over a half step;
+  \item reconstruct the old-time distribution at one-dimensional or tensor-product physical-space quadrature points;
+  \item apply a half collision step using either the conservative Boltzmann operator or the exact BGK relaxation;
+  \item evolve all boundary point values along molecular characteristics and compute the one-dimensional exact time average or two-dimensional space--time Simpson average;
+  \item update cell averages with the conservative kinetic flux balance;
+  \item repeat the reconstructed collision evolution over a half step;
   \item refresh discrete velocity moments and boundary ghosts.
 \end{enumerate}
+For the method-of-lines path, the state is first packed into cell-average and shared-point blocks. Each call to the right-hand side then evaluates Eqs.~\eqref{eq:semidiscrete-cell-average}--\eqref{eq:semidiscrete-upwind-derivative}, adds either the quadrature collision or equilibrium-projection collision, and applies the boundary closure. An ordinary differential equation solver controls the Runge--Kutta stages and time-step acceptance. In the split problem, the stiff collision function is listed first and transport second, following the implicit--explicit convention of \texttt{OrdinaryDiffEq.jl}. The smooth periodic case implements this complete interface in \texttt{advection.jl}. The shock tube implements its case-specific limited transport right-hand side in \texttt{sod.jl}; conservative two-stage successive-penalty FSM half steps surround an \texttt{SSPRK33} solve of that right-hand side. Its executable workflow is divided into \texttt{sod\_simulation.jl}, which saves one portable JLD2 state for each reference Knudsen number, and \texttt{sod\_plot.jl}, which reads those states without loading the solver. The shared normal-shock solver \texttt{shock.jl} packs the \texttt{1d1f3v} distribution in the same way and reuses one explicit-Euler \texttt{ODEProblem} transport step for both collision models. Reconstructed collision half steps dispatch either to the full FSM operator or to exact BGK relaxation, so changing the collision model does not alter the spatial transport path. Euler integration is selected for this preliminary, collision-dominated comparison to minimize transport-stage cost rather than to pursue high temporal accuracy. Because FSM evaluation dominates the wall time, the executable workflow is divided into \texttt{shock\_boltzmann.jl}, \texttt{shock\_bgk.jl}, and \texttt{shock\_plot.jl}: the first two independently save portable JLD2 data, while the third reads those files and produces the comparison without initializing either solver.
 
-\section{Accuracy and conservation}
+\section{Numerical experiments}
+\label{sec:numerical}
+
+The validation is arranged as four cases of increasing physical and numerical complexity. The accuracy case uses the \texttt{1d1f1v} BGK specialization. Its two convergence programs deliberately retain characteristic active-flux transport and temporal over-resolution so that their tables continue to measure spatial accuracy. The standalone periodic driver uses the complete \texttt{OrdinaryDiffEq.jl} interface. The Sod case changes to a \texttt{1d1f3v} full-Boltzmann model and compares three reference Knudsen numbers with the same transport discretization. The third case also uses \texttt{1d1f3v} and directly compares the full fast-spectral Boltzmann collision integral with BGK. Its present calculation is deliberately short and coarse, so it verifies the implementation and reveals initial model sensitivity but is not presented as a converged steady shock. The lid-driven cavity remains a fully specified two-dimensional target. A strong-AP homogeneous collision map is exercised down to $\mathrm{Kn}=10^{-4}$, but uniform-in-Knudsen accuracy evidence for the complete scheme is not yet reported as a completed result.
+
+\subsection{Case 1: Accuracy tests}
 \label{sec:accuracy}
 
-\subsection{Exact transport test}
+\subsubsection{One-dimensional exact transport}
 
 The collisionless equation admits the exact solution
 \begin{equation}
@@ -310,9 +693,10 @@ Table~\ref{tab:transport-convergence} and Fig.~\ref{fig:transport-convergence} s
   \label{fig:transport-convergence}
 \end{figure}
 
-\subsection{Temporally over-resolved BGK test}
+\FloatBarrier
+\subsubsection{Temporally over-resolved BGK test}
 
-The full method combines third-order active flux transport with second-order Strang splitting. With a fixed molecular $\cfl$, $\Delta t=O(\Delta x)$ and the $O(\Delta t^2)$ splitting error masks third-order spatial convergence. To expose the spatial behavior while retaining Strang splitting, the time step is refined as
+The implemented BGK method combines third-order active flux transport with second-order Strang splitting. With a fixed molecular $\cfl$, $\Delta t=O(\Delta x)$ and the $O(\Delta t^2)$ splitting error masks third-order spatial convergence. To expose the spatial behavior while retaining Strang splitting, the time step is refined as
 \begin{equation}
   \Delta t = C\frac{\Delta x^{3/2}}{v_{\max}},
   \label{eq:overresolved-step}
@@ -345,7 +729,7 @@ The periodic wave in Eq.~\eqref{eq:wave-initial} is evolved with $\mathrm{Kn}=10
   \label{fig:bgk-convergence}
 \end{figure}
 
-For a representative periodic computation with $N_x=200$, $N_v=48$, $\mathrm{Kn}=10^{-2}$, and $t=0.1$, the relative drift of mass, momentum, and energy is approximately $5.3\times10^{-14}$. Figure~\ref{fig:periodic-wave} shows the corresponding macroscopic profiles. These results confirm that the velocity-moment correction and conservative interface flux are consistent at the fully discrete level.
+For a representative periodic computation with $N_x=200$, $N_v=48$, $\mathrm{Kn}=10^{-2}$, and $t=0.1$, the semi-discrete problem is integrated by \texttt{Tsit5} with the molecular CFL bound imposed as the maximum accepted step. The calculation uses 235 accepted steps; the largest relative drift among mass, momentum, and energy is $7.8\times10^{-16}$. Figure~\ref{fig:periodic-wave} shows the corresponding macroscopic profiles. These results confirm that the velocity-moment correction, conservative interface flux, and general ODE interface are mutually consistent.
 
 \begin{figure}[htbp]
   \centering
@@ -354,7 +738,15 @@ For a representative periodic computation with $N_x=200$, $N_v=48$, $\mathrm{Kn}
   \label{fig:periodic-wave}
 \end{figure}
 
-\section{Sod shock tube}
+\FloatBarrier
+\subsubsection{Planned asymptotic-preserving verification}
+
+The formal result in Section~\ref{sec:ap-analysis} requires a separate uniform-in-Knudsen experiment rather than another spatial order table. The physical mesh, velocity grid, and transport CFL number will be held fixed while $\mathrm{Kn}$ is decreased from the kinetic regime to values much smaller than $\Delta t$. The equilibrium-projection IMEX solution will be compared with a compressible Euler reference on the same physical mesh. The reported quantities will be the macroscopic error, accepted time steps, minimum distribution, collision-invariant drift, and the norm of the microscopic departure $f_h-\mathcal{M}_d[\vct{W}_h]$. AP behavior requires bounded cost and convergence to the discrete Euler solution without choosing $\Delta t=O(\mathrm{Kn})$. A second comparison with the quadrature-collision option will expose the equilibrium-null-space defect discussed above.
+
+\resultplaceholder{Insert the fixed-grid Knudsen sweep for the equilibrium-projection IMEX method and the quadrature-collision method. Plot the macroscopic error and accepted-step count against $\mathrm{Kn}$, and include an Euler-reference profile at the smallest Knudsen number.}
+
+\FloatBarrier
+\subsection{Case 2: Sod shock tube}
 \label{sec:sod}
 
 The Sod problem \cite{sod1978survey} is employed to assess the shock-capturing and positivity properties. The initial states are
@@ -364,7 +756,7 @@ The Sod problem \cite{sod1978survey} is employed to assess the shock-capturing a
   (\rho,U,p)_R=(0.125,0,0.1),
   \label{eq:sod-states}
 \end{equation}
-separated at $x=0.5$. Table~\ref{tab:sod-setup} lists the computational setup. The small Knudsen number places the BGK solution close to the inviscid Euler limit. At the initial discontinuity, right-moving particles take the left Maxwellian and left-moving particles take the right Maxwellian, which provides a kinetic upwind trace for the shared point value.
+separated at $x=0.5$. The distribution is resolved in three molecular-velocity dimensions, and collision is evaluated with the full fast-spectral Boltzmann operator. Table~\ref{tab:sod-setup} lists the computational setup. Three reference Knudsen numbers span continuum-like, transition, and rarefied regimes over the short observation time. At the initial discontinuity, right-moving particles take the left Maxwellian and left-moving particles take the right Maxwellian, which provides a kinetic upwind trace for the shared point value.
 
 \begin{table}[htbp]
   \centering
@@ -375,33 +767,149 @@ separated at $x=0.5$. Table~\ref{tab:sod-setup} lists the computational setup. T
     Quantity & Value \\
     \midrule
     Physical domain & $x\in[0,1]$ \\
-    Physical cells & $N_x=200$ \\
-    Velocity domain & $v\in[-5,5]$ \\
-    Velocity points & $N_v=72$ \\
-    Gas model & $K=0$, $\gamma=3$ \\
-    Knudsen number & $10^{-4}$ \\
+    Physical cells & $N_x=32$ \\
+    Velocity domain & $(u,v,w)\in[-6,6]^3$ \\
+    Velocity points & $N_u\times N_v\times N_w=16\times12\times12$ \\
+    Gas model & monatomic, $K=0$, $\gamma=5/3$ \\
+    Collision model & full Boltzmann FSM, $\alpha=1$, $\omega=0.72$ \\
+    Reference Knudsen numbers & $10^{-4}$, $10^{-2}$, $1$ \\
     Molecular CFL number & $0.45$ \\
+    Transport integrator & \texttt{SSPRK33} through \texttt{ODEProblem} \\
+    Collision integrator & two-stage successive BGK penalty in Strang half steps \\
     Final time & $0.12$ \\
     Boundary condition & fixed incoming Maxwellian reservoirs \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Figure~\ref{fig:sod} shows the density, velocity, and pressure, together with the exact Euler Riemann solution for $\gamma=3$. The rarefaction fan, contact wave, and right-moving shock propagate at the expected speeds. Density across the contact is more diffuse than the pressure and velocity because the kinetic jump sensor activates the upwind component over that region. Small smooth overshoots remain in the velocity plateau, but no negative cell-average distribution is produced. The simulation reaches $t=0.12$ in 263 steps, and the minimum cell-average distribution is $6.9\times10^{-17}$. The result demonstrates that the active flux representation can be extended from smooth kinetic transport to a discontinuous collisional flow when shock sensing and positivity control are included.
+\FloatBarrier
+
+Figure~\ref{fig:sod} compares density, velocity, pressure, and heat flux at $\mathrm{Kn}=10^{-4}$, $10^{-2}$, and $1$, together with the exact Euler Riemann solution for $\gamma=5/3$. All calculations reach $t=0.12$ in 48 transport-CFL steps. The five-moment projection reduces the largest collision-invariant residual over the complete sweep to $2.2\times10^{-14}$, and the positive exponential correction gives a minimum stored distribution of zero without altering those moments. On this deliberately coarse physical and velocity grid, the rarefaction, contact region, and right-moving compression are resolved but remain more diffuse than the inviscid Euler reference; the result is therefore an implementation comparison rather than a mesh-converged shock-tube benchmark.
+
+The successive penalty changes the small-Knudsen result qualitatively. At $\mathrm{Kn}=10^{-4}$, the velocity-weighted relative departure from the local discrete Maxwellian is $1.88\times10^{-3}$ and the relative entropy per unit mass is $2.67\times10^{-5}$. The corresponding values are $1.08\times10^{-1}$ and $1.61\times10^{-2}$ at $\mathrm{Kn}=10^{-2}$, and $1.13\times10^{-1}$ and $1.84\times10^{-2}$ at $\mathrm{Kn}=1$. The continuum-like state is therefore demonstrably close to the equilibrium manifold rather than merely stable. Relative to $\mathrm{Kn}=10^{-4}$, the discrete relative $L^2$ differences in density are $2.53\times10^{-2}$ and $2.67\times10^{-2}$ for $\mathrm{Kn}=10^{-2}$ and $1$; the corresponding velocity differences are $1.30\times10^{-1}$ and $1.36\times10^{-1}$, and the pressure differences are $6.34\times10^{-2}$ and $6.42\times10^{-2}$. The heat-flux peak-to-peak ranges are $8.35\times10^{-3}$, $1.35\times10^{-1}$, and $1.33\times10^{-1}$. Thus Fig.~\ref{fig:sod} clearly separates the near-equilibrium continuum result from the two kinetic results. The $\mathrm{Kn}=10^{-2}$ and $1$ profiles remain relatively close on the present coarse grid and short time, so further resolution is needed before interpreting their difference quantitatively. The simulation program stores the physical and velocity grids, cell and interface distributions, macroscopic states, diagnostics, and Euler reference profiles in \texttt{data/sod\_kn1e-4.jld2}, \texttt{data/sod\_kn1e-2.jld2}, and \texttt{data/sod\_kn1.jld2}; the plotting program obtains Fig.~\ref{fig:sod} exclusively from those files.
 
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=0.82\textwidth]{figures/sod-shock-tube.pdf}
-  \caption{Sod shock tube at $t=0.12$. The active flux BGK solution is compared with the exact Euler Riemann solution for $\gamma=3$.}
+  \caption{Full-Boltzmann Sod shock tube at $t=0.12$ for $\mathrm{Kn}=10^{-4}$, $10^{-2}$, and $1$. All three calculations use the same \texttt{1d1f3v} active flux discretization and conservative fast-spectral collision operator. The exact Euler Riemann solution for $\gamma=5/3$ is included in the first three panels; heat flux has no Euler counterpart.}
   \label{fig:sod}
 \end{figure}
 
+\FloatBarrier
+\subsection{Case 3: Normal shock structure}
+\label{sec:normal-shock}
+
+The normal shock provides a direct full-Boltzmann/BGK collision-model comparison. It is stationary in the shock-attached frame and resolves a non-equilibrium layer whose thickness is comparable to the molecular mean free path. In the present normalization the upstream primitive state is $\rho_1=1$, $\lambda_1=1$, $p_1=T_1=1/2$, and $U_1=\mathrm{Ma}_1\sqrt{\gamma/2}$. For a monatomic gas with a three-dimensional molecular velocity, $K=0$ and $\gamma=5/3$. The downstream equilibrium state follows from the Rankine--Hugoniot relations,
+\begin{align}
+  \frac{\rho_2}{\rho_1}
+  & =\frac{(\gamma+1)\mathrm{Ma}_1^2}
+  {(\gamma-1)\mathrm{Ma}_1^2+2},
+  &
+  \frac{U_2}{U_1}
+  & =\frac{\rho_1}{\rho_2},
+  \label{eq:normal-shock-density}\\
+  \frac{p_2}{p_1}
+  & =1+\frac{2\gamma}{\gamma+1}
+  \left(\mathrm{Ma}_1^2-1\right),
+  &
+  T_2
+  & =\frac{p_2\rho_1}{p_1\rho_2}T_1.
+  \label{eq:normal-shock-pressure}
+\end{align}
+Incoming particles at the left and right boundaries are assigned the corresponding upstream and downstream discrete Maxwellians. The full collision integral uses the variable-hard-sphere fast spectral method \cite{mouhot2006fast,xiao2021flux} and the conservative projection in Eq.~\eqref{eq:collision-projection}. The same active flux transport right-hand side is integrated by explicit Euler through \texttt{ODEProblem} for both the Boltzmann and BGK calculations; only the local collision routine changes. Mach numbers two and three remain the target steady tests and allow direct comparison with the earlier flux reconstruction Boltzmann study \cite{xiao2021flux}.
+
+The two collision models are deliberately run as separate jobs. The full-Boltzmann driver writes \texttt{data/shock\_boltzmann.jld2}, and the BGK driver writes \texttt{data/shock\_bgk.jld2}. Each file contains the physical and velocity grids, cell and interface distributions, conservative and primitive variables, reservoir states, scalar diagnostics, and the derived one-dimensional profiles. Session-specific solver objects and the large precomputed FSM kernel are omitted. A third program validates and compares these files to generate Fig.~\ref{fig:normal-shock-preliminary}; changing plot styles or diagnostics therefore does not repeat the costly collision calculation.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Computational setup of the preliminary normal-shock comparison.}
+  \label{tab:normal-shock-setup}
+  \begin{tabular}{ll}
+    \toprule
+    Quantity & Value \\
+    \midrule
+    Physical domain & $x\in[-25,25]$ \\
+    Physical cells & $N_x=16$ \\
+    Velocity domain & $\vct{v}\in[-10,10]^3$ \\
+    Velocity points & $32\times24\times24$ \\
+    Gas model & monatomic, $K=0$, $\gamma=5/3$ \\
+    Collision models & full Boltzmann FSM and BGK \\
+    VHS/FSM parameters & $\omega=0.72$, $\alpha=1$, $N_{\rho}=3$ \\
+    Knudsen and Mach numbers & $\mathrm{Kn}=1$, $\mathrm{Ma}_1=2$ \\
+    Molecular CFL number & $0.35$ \\
+    Transport integrator & explicit Euler through \texttt{ODEProblem} \\
+    Initial transition & Maxwellian mixture, width $2$ \\
+    Final time & $0.3$ (three Strang steps) \\
+    Boundary condition & fixed incoming Maxwellians \\
+    Purpose & short-time implementation comparison \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\FloatBarrier
+
+The finite Fourier grid gives a small nonzero raw value of $\mathcal{Q}_h(\mathcal{M}_d,\mathcal{M}_d)$. The implementation therefore evaluates the well-balanced difference $\mathcal{Q}_h(f,f)-\mathcal{Q}_h(\mathcal{M}_d,\mathcal{M}_d)$ before applying the five-invariant projection. An explicit midpoint collision update is sufficient at $\mathrm{Kn}=1$. Small negative Fourier undershoots are removed by an exponential moment projection: after clipping, $f$ is multiplied by $\exp(\vct{\alpha}\cdot\vct{\psi})$, where the five coefficients are obtained by Newton iteration so that mass, three momentum components, and energy return to their pre-collision values. BGK uses the same positive discrete Maxwellian and is exact over each collision half step.
+
+Figure~\ref{fig:normal-shock-preliminary} shows the finite-time result. Because only three transport steps have been taken, density and velocity have barely separated between the two collision models: their relative $L^2$ differences are $9.86\times10^{-5}$ and $7.45\times10^{-5}$. Temperature is more sensitive, with a difference of $1.84\times10^{-3}$, while the heat-flux profiles differ by $9.15\times10^{-2}$. This ordering is physically useful: heat flux probes the non-equilibrium part of the distribution and responds to the collision model before conserved profiles develop an easily visible difference. The maximum projected Boltzmann collision-moment residual is $1.44\times10^{-15}$, and the minimum FSM cell-average distribution is zero to machine precision. Since FSM collision dominates the wall time, Euler reduces the transport right-hand-side calls from three to one per step. Standalone elapsed times, which include Julia compilation and are platform dependent, are stored with each result for diagnostics but are not treated as performance benchmarks.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.90\textwidth]{figures/normal-shock-comparison.pdf}
+  \caption{Preliminary normal shock at $\mathrm{Ma}_1=2$ and $t=0.3$. Full Boltzmann fast-spectral and BGK collisions use identical active flux transport, initial data, grids, and kinetic reservoir boundaries. The heat flux reveals a larger short-time model difference than density, velocity, or temperature.}
+  \label{fig:normal-shock-preliminary}
+\end{figure}
+
+This result is an implementation check, not a reference-quality steady shock profile. The next calculation will retain the same code path while increasing the final time, physical resolution, and velocity resolution, followed by the $\mathrm{Ma}_1=3$ case. That study will report normalized normal stress, shock thickness, collision-invariant drift, minimum distribution, and mesh/velocity-grid sensitivity against a resolved fast-spectral or DSMC reference.
+
+\FloatBarrier
+\subsection{Case 4: Two-dimensional lid-driven cavity}
+\label{sec:lid-driven-cavity}
+
+The lid-driven cavity is the genuinely two-dimensional full Boltzmann test. The gas occupies $\Omega_x=[0,1]^2$. All walls are maintained at the nondimensional temperature $T_w=1$; the upper wall moves with $\vct{U}_w=(0.15,0,0)^T$, while the remaining walls are stationary. Maxwell diffuse reflection supplies the incoming distribution at each wall. Because the wall normal changes around the cavity, this problem exercises all corner and edge-midpoint degrees of freedom, the sign condition $\vct{v}_x\cdot\vct{n}<0$, and the two-dimensional characteristic-foot selection.
+
+The planned Knudsen numbers $\mathrm{Kn}=0.2/\sqrt{\pi}$, $2/\sqrt{\pi}$, and $20/\sqrt{\pi}$ span the slip, transition, and nearly free-molecular regimes. The initial discretization in Table~\ref{tab:cavity-setup} follows the hierarchy used in Ref.~\cite{xiao2021flux}; at least one physical-mesh and velocity-grid refinement will be added so that agreement is not assessed on a single resolution.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Planned computational setup for the two-dimensional lid-driven cavity.}
+  \label{tab:cavity-setup}
+  \begin{tabular}{ll}
+    \toprule
+    Quantity & Planned value \\
+    \midrule
+    Physical domain & $(x,y)\in[0,1]^2$ \\
+    Baseline physical mesh & $N_x\times N_y=15\times15$ \\
+    Velocity domain & $\vct{v}\in[-8,8]^3$ \\
+    Baseline velocity grid & $32\times32\times28$ \\
+    Lid velocity and wall temperature & $U_w=0.15$, $T_w=1$ \\
+    Knudsen numbers & $\{0.2,2,20\}/\sqrt{\pi}$ \\
+    Collision model & full Boltzmann \\
+    Wall condition & Maxwell diffuse reflection \\
+    Molecular CFL number & $0.15$ \\
+    Convergence criterion & residual tolerance to be reported \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\FloatBarrier
+
+The primary fields will be the velocity magnitude and streamlines, temperature, and heat-flux vectors. Centerline velocity profiles and wall shear stress will provide quantitative comparisons with a DSMC or established deterministic Boltzmann reference. In the transition regime, the temperature and heat-flux plots should also reveal whether stress-driven non-Fourier heat transport is recovered. Conservation residuals and the minimum distribution value will be monitored throughout the steady iteration.
+
+\resultplaceholder{Insert contours of horizontal velocity with streamlines and temperature with heat-flux vectors for each Knudsen number. The final layout should use common color ranges wherever meaningful so that the regime transition can be compared directly.}
+
+\resultplaceholder{Insert horizontal and vertical centerline velocity profiles, wall shear stress, and the selected DSMC or deterministic reference data. Include a mesh/velocity-grid refinement inset before drawing quantitative conclusions.}
+
+\FloatBarrier
 \section{Conclusion}
 \label{sec:conclusion}
 
-Kinetic equations provide a direct connection between particle transport and macroscopic flow evolution, but their phase-space dimensionality places strong demands on numerical resolution. In this paper, an active flux kinetic scheme has been formulated for the one-dimensional BGK equation. Cell averages and shared interface values define a compact continuous reconstruction, while molecular characteristics evolve the point values and provide conservative time-averaged fluxes. Pointwise Gaussian relaxation preserves the spatial accuracy of the nonlinear source, and the corrected discrete Maxwellian conserves the quadrature moments to roundoff. The exact transport experiment identifies third-order convergence of both the distribution and density. With temporal over-resolution, the complete BGK algorithm reaches the same spatial rate despite the second-order Strang splitting. The shock-limited formulation remains positive and captures the principal structures of the Sod problem.
+Kinetic equations provide a direct connection between particle transport and macroscopic flow evolution, but their phase-space dimensionality places strong demands on numerical resolution. In this paper, an active flux kinetic formulation has been developed from the discrete-velocity Boltzmann equation on one- and two-dimensional Cartesian physical domains. Cell averages and shared boundary point values define compact continuous reconstructions, while molecular characteristics evolve the point values and provide conservative time-averaged fluxes. In two dimensions, a biparabolic reconstruction and space--time Simpson quadrature extend the construction without dimensional splitting. The collision interface admits a conservative fast spectral Boltzmann operator and the BGK model as a simplified specialization. Thus, the use of BGK in the accuracy verification is a validation choice rather than a restriction of the physical-space method. A semi-discrete form separates the active flux spatial right-hand side from temporal integration and supports both ordinary and split differential-equation problems.
 
-The current method provides a compact framework for further development of collisional active flux solvers. The next step is to replace the BGK relaxation by the full Boltzmann collision operator, for example through a fast spectral formulation, while retaining the active flux transport and discrete conservation treatment. Multi-dimensional physical and velocity spaces, less dissipative bound-preserving limiters, gas-surface interaction, and asymptotic-preserving time integration are also natural extensions. These developments may lead to an efficient high-order tool for cross-scale and non-equilibrium flow simulation.
+The numerical programme is organized into four cases. The completed one-dimensional accuracy experiment identifies third-order convergence of both the distribution and density. With temporal over-resolution, the retained characteristic--Strang benchmark reaches the same spatial rate despite second-order splitting. The standalone periodic BGK case verifies the complete \texttt{ODEProblem} interface. The Sod calculation then exercises the full FSM collision integral in \texttt{1d1f3v} at three Knudsen numbers; its shock-limited \texttt{SSPRK33} transport captures the principal wave structures, and the successive collision penalty produces clear macroscopic and heat-flux separation between the near-equilibrium $\mathrm{Kn}=10^{-4}$ result and the kinetic results. The preliminary normal shock uses the same projected FSM machinery in a direct comparison with BGK and identifies heat flux as the earlier discriminator between collision models. A refined Sod study, a steady refined normal shock, and the genuinely two-dimensional lid-driven cavity remain necessary before quantitative physical validation is claimed.
+
+The asymptotic analysis also clarifies the status of the time discretization. An explicit Runge--Kutta method applied to the complete kinetic right-hand side is not AP because it resolves the collision time. In contrast to the former single-denominator update, the two-stage penalized full-Boltzmann collision map used by the Sod driver has a strong homogeneous AP limit: for arbitrary non-equilibrium input, its microscopic component vanishes as the collision time tends to zero. Its Strang composition with the shock-limited transport solver does not alone establish uniform accuracy or convergence to the discrete Euler solution, however. The equilibrium-projection BGK source paired with a stiffly accurate implicit--explicit method is formally AP at the Euler level; a macro--micro reconstruction is still needed to combine this property with uniform high-order finite-Knudsen accuracy. For the full Boltzmann equation, the corresponding long-term target is a stage-coupled conservative BGK penalization rather than a direct nonlinear implicit collision solve.
+
+The immediate research tasks are therefore part of the central scope rather than optional extensions: use a fixed physical and temporal grid to quantify the complete scheme uniformly in Knudsen number, extend the collision-level successive penalty to a globally stiffly accurate full-Boltzmann implicit--explicit method, refine the three Sod calculations, extend the preliminary normal shock to steady Mach-two and Mach-three profiles, and complete the lid-driven cavity results in Section~\ref{sec:lid-driven-cavity}. Less dissipative bound-preserving limiting and gas-surface interaction can then be assessed within the resulting one- and two-dimensional multiscale framework.
 
 \section*{CRediT authorship contribution statement}
 
@@ -413,7 +921,7 @@ The author declares that there are no known competing financial interests or per
 
 \section*{Data and code availability}
 
-The Julia programs used to produce the numerical results are included in the \texttt{src/} directory of the accompanying repository. The LaTeX manuscript and generated figures are provided in \texttt{tex/}. No external experimental data are required.
+The Julia programs in the \texttt{src/} directory retain targeted, case-specific entry points. The file \texttt{advection.jl} contains the periodic BGK data, semi-discrete transport and collision right-hand sides, and the corresponding \texttt{ODEProblem} and optional \texttt{SplitODEProblem}. For the shock tube, \texttt{sod.jl} supplies the self-contained \texttt{1d1f3v} data, FSM collision workspace, limiter, boundary treatment, and case-specific transport \texttt{ODEProblem}; \texttt{sod\_simulation.jl} writes three compressed JLD2 results and \texttt{sod\_plot.jl} compares only their saved arrays. For the computationally heavier third case, \texttt{shock.jl} supplies the shared \texttt{1d1f3v} solver, \texttt{shock\_boltzmann.jl} and \texttt{shock\_bgk.jl} independently write compressed JLD2 results, and \texttt{shock\_plot.jl} compares only the saved arrays. The programs \texttt{convergence1-transport.jl} and \texttt{convergence2-overresolve.jl} retain their characteristic algorithms solely for the spatial-accuracy measurements. A conservative two-stage successive-penalty full-Boltzmann collision map is implemented for Sod; a uniformly accurate AP integrator and the two-dimensional solver described by the general formulation have not yet been added. The LaTeX manuscript and generated figures are provided in \texttt{tex/}. No external experimental data are required.
 
 \bibliographystyle{elsarticle-num}
 \bibliography{references}
