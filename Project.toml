@@ -5,12 +5,19 @@ authors = ["Tianbai Xiao <tianbaixiao@gmail.com>"]
 
 [deps]
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 KitBase = "86eed249-3a28-466f-8d3a-596821e1af9a"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+OrdinaryDiffEqSDIRK = "2d112036-d095-4a1e-ab9a-08536f3ecdbf"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
 
 [compat]
 CairoMakie = "0.15.13"
+JLD2 = "0.6"
 KitBase = "0.9"
+OrdinaryDiffEq = "6.111.0"
+OrdinaryDiffEqSDIRK = "1.14.0"
 Plots = "1.41.6"
 
 [extras]
