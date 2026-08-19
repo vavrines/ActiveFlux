@@ -15,7 +15,7 @@ BGK solution is available, a fine-grid BGK solution is restricted
 conservatively onto each comparison grid.
 """
 
-include(joinpath(@__DIR__, "bgk_advection_convergence.jl"))
+include(joinpath(@__DIR__, "convergence1-transport.jl"))
 
 """Return the refined time step `C*dx^power/umax` for one solver setup."""
 function overresolved_timestep(ks, coefficient, power)

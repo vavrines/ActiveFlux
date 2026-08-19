@@ -10,7 +10,7 @@ exact solution is `f(x,u,t) = f₀(x-u*t,u)`, so the transport discretization ca
 be tested independently of Strang splitting and BGK collision errors.
 """
 
-include(joinpath(@__DIR__, "bgk_advection.jl"))
+include(joinpath(@__DIR__, "advection.jl"))
 
 """Evaluate the initial Maxwellian at one physical point and one velocity."""
 function initial_distribution(x, velocity)

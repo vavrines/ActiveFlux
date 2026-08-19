@@ -1,18 +1,22 @@
 """
-One-dimensional BGK equation solved with the active flux method.
+One-dimensional periodic BGK advection case solved with active flux.
 
 The kinetic equation is
 
     ∂ₜf + u ∂ₓf = (M[f] - f) / τ,
 
 on a periodic physical domain. Both physical space and molecular velocity are
-one-dimensional (`1d1f1v`). The active flux method advects the single
-distribution `f(x,u,t)` for every discrete molecular velocity. Exact local BGK
-relaxation is applied in a second-order Strang splitting.
+one-dimensional (1d1f1v). The active flux method advects the single
+distribution f(x,u,t) for every discrete molecular velocity. The production
+driver packs the active-flux degrees of freedom into an OrdinaryDiffEq
+ODEProblem, while the characteristic--Strang functions are retained for the
+two spatial-convergence scripts.
 """
 
 using KitBase
 using KitBase.OffsetArrays
+using OrdinaryDiffEq: ODEProblem, SSPRK33, SplitODEProblem, Tsit5, solve
+using OrdinaryDiffEqSDIRK: KenCarp4
 using Plots
 
 # Four-point Gauss-Legendre rule used to initialize genuine cell averages of
@@ -459,6 +463,332 @@ function solve_bgk_active_flux(; fixed_dt=nothing, kwargs...)
     return (; ks, ctr, face, time, steps, stats)
 end
 
+# ---------------------------------------------------------------------------
+# Semi-discrete OrdinaryDiffEq formulation used by this advection case.
+# ---------------------------------------------------------------------------
+
+"""Parameters passed to every in-place active-flux right-hand side."""
+struct AdvectionRHSParameters{KS}
+    ks::KS
+end
+
+"""Packed-state column containing the interface at the left of cell i."""
+@inline advection_interface_column(parameters::AdvectionRHSParameters, i) =
+    parameters.ks.ps.nx + i
+
+"""
+Pack the active-flux degrees of freedom into an OrdinaryDiffEq state array.
+
+Rows enumerate molecular velocities. Columns 1:nx store physical-space cell
+averages and columns nx+1:2nx store the nx distinct periodic interface point
+values. The duplicate and ghost interfaces remain implementation details of
+the plotting and diagnostic containers and therefore are not integrated.
+"""
+function pack_advection_state(ks, ctr, face)
+    state = zeros(eltype(ctr[1].f), ks.vs.nu, 2 * ks.ps.nx)
+    for i in 1:ks.ps.nx
+        @views state[:, i] .= ctr[i].f
+        @views state[:, ks.ps.nx+i] .= face[i].f
+    end
+    return state
+end
+
+"""Copy a packed ODE state back to active-flux cells and interfaces."""
+function unpack_advection_state!(state, ks, ctr, face)
+    nx = ks.ps.nx
+    size(state) == (ks.vs.nu, 2 * nx) ||
+        throw(DimensionMismatch("expected a $(ks.vs.nu) by $(2 * nx) state"))
+
+    for i in 1:nx
+        @views ctr[i].f .= state[:, i]
+        update_macroscopic!(ctr[i], ks)
+
+        @views face[i].f .= state[:, nx+i]
+        face[i].favg .= face[i].f
+        update_macroscopic!(face[i], ks)
+    end
+    apply_periodic_boundary!(ks, ctr, face)
+    return nothing
+end
+
+"""
+Evaluate the semi-discrete periodic active-flux transport operator.
+
+For a positive velocity, an interface uses the derivative at the right end of
+the quadratic in the upwind cell,
+
+    p'(1)/dx = (2*f_left - 6*f_average + 4*f_right)/dx.
+
+For a negative velocity it uses the derivative at the left end of the cell on
+the right,
+
+    p'(0)/dx = (-4*f_left + 6*f_average - 2*f_right)/dx.
+
+The cell-average equation is the conservative difference of the shared point
+values. This function contains no Runge--Kutta coefficient or step size, so it
+can be reused by any compatible OrdinaryDiffEq algorithm.
+"""
+function advection_transport_rhs!(derivative, state, parameters, time)
+    ks = parameters.ks
+    nx, nu = ks.ps.nx, ks.vs.nu
+    dx = ks.ps.dx[1]
+    size(state) == (nu, 2 * nx) ||
+        throw(DimensionMismatch("invalid advection state size $(size(state))"))
+    fill!(derivative, zero(eltype(derivative)))
+
+    # Conservative evolution of the cell-average degrees of freedom.
+    for i in 1:nx
+        right_interface = mod1(i + 1, nx)
+        left_column = advection_interface_column(parameters, i)
+        right_column = advection_interface_column(parameters, right_interface)
+        for j in 1:nu
+            derivative[j, i] = -ks.vs.u[j] / dx *
+                               (state[j, right_column] - state[j, left_column])
+        end
+    end
+
+    # Upwind evolution of every shared interface point value.
+    for i in 1:nx
+        point_column = advection_interface_column(parameters, i)
+        left_cell = mod1(i - 1, nx)
+        right_cell = i
+        far_left_column = advection_interface_column(parameters, left_cell)
+        far_right_column =
+            advection_interface_column(parameters, mod1(right_cell + 1, nx))
+
+        for j in 1:nu
+            velocity = ks.vs.u[j]
+            spatial_derivative = if velocity >= 0
+                (2 * state[j, far_left_column] -
+                 6 * state[j, left_cell] + 4 * state[j, point_column]) / dx
+            else
+                (-4 * state[j, point_column] +
+                 6 * state[j, right_cell] - 2 * state[j, far_right_column]) / dx
+            end
+            derivative[j, point_column] = -velocity * spatial_derivative
+        end
+    end
+    return nothing
+end
+
+"""Evaluate the discretely conservative BGK source of one distribution."""
+function conservative_bgk_rhs!(collision, distribution, ks)
+    moments = moments_conserve(
+        distribution,
+        ks.vs.u,
+        ks.vs.weights,
+        KitBase.VDF{1,1},
+    )
+    primitive = conserve_prim(moments, ks.gas.γ)
+    collision_time = vhs_collision_time(primitive, ks.gas.μᵣ, ks.gas.ω)
+    equilibrium = discrete_conservative_maxwellian(ks, moments, primitive)
+    @. collision = (equilibrium - distribution) / collision_time
+    return nothing
+end
+
+"""
+Evaluate the finite-Knudsen BGK collision part of the packed state.
+
+For a cell-average degree of freedom, the quadratic active-flux
+reconstruction is evaluated at four Gauss points, the nonlinear BGK source is
+formed at each point, and those sources are integrated back to a cell average.
+Interface degrees of freedom are collided pointwise. Thus the RHS preserves
+the high-order physical-space treatment of collision used by the original
+Strang implementation.
+"""
+function advection_collision_rhs!(derivative, state, parameters, time)
+    ks = parameters.ks
+    nx, nu = ks.ps.nx, ks.vs.nu
+    fill!(derivative, zero(eltype(derivative)))
+    point_distribution = similar(state, eltype(state), nu)
+    point_collision = similar(state, eltype(state), nu)
+
+    for i in 1:nx
+        left_column = advection_interface_column(parameters, i)
+        right_column =
+            advection_interface_column(parameters, mod1(i + 1, nx))
+        average_collision = @view derivative[:, i]
+
+        for q in eachindex(GL4_NODES)
+            ξ = 0.5 * (GL4_NODES[q] + 1)
+            left_basis = 3ξ^2 - 4ξ + 1
+            average_basis = 6ξ - 6ξ^2
+            right_basis = 3ξ^2 - 2ξ
+            @views @. point_distribution =
+                left_basis * state[:, left_column] +
+                average_basis * state[:, i] +
+                right_basis * state[:, right_column]
+            conservative_bgk_rhs!(point_collision, point_distribution, ks)
+            @. average_collision += 0.5 * GL4_WEIGHTS[q] * point_collision
+        end
+    end
+
+    for i in 1:nx
+        column = advection_interface_column(parameters, i)
+        conservative_bgk_rhs!(
+            @view(derivative[:, column]),
+            @view(state[:, column]),
+            ks,
+        )
+    end
+    return nothing
+end
+
+"""
+Evaluate the equilibrium-projection BGK collision used by the IMEX option.
+
+Every active-flux degree of freedom is relaxed toward a discrete Maxwellian
+with the same moments. This gives the exact discrete equilibrium null space
+needed by the formal Euler-limit AP argument. It is kept separate from the
+Gauss-quadrature source because the latter is the finite-Knudsen high-order
+choice, whereas a uniformly accurate AP collision reconstruction remains a
+future step.
+"""
+function advection_equilibrium_collision_rhs!(
+    derivative,
+    state,
+    parameters,
+    time,
+)
+    ks = parameters.ks
+    fill!(derivative, zero(eltype(derivative)))
+    for column in axes(state, 2)
+        conservative_bgk_rhs!(
+            @view(derivative[:, column]),
+            @view(state[:, column]),
+            ks,
+        )
+    end
+    return nothing
+end
+
+"""Add active-flux transport and quadrature BGK collision in place."""
+function advection_bgk_rhs!(derivative, state, parameters, time)
+    advection_transport_rhs!(derivative, state, parameters, time)
+    collision = similar(derivative)
+    advection_collision_rhs!(collision, state, parameters, time)
+    derivative .+= collision
+    return nothing
+end
+
+"""Add transport and equilibrium-projection collision in place."""
+function advection_ap_bgk_rhs!(derivative, state, parameters, time)
+    advection_transport_rhs!(derivative, state, parameters, time)
+    collision = similar(derivative)
+    advection_equilibrium_collision_rhs!(collision, state, parameters, time)
+    derivative .+= collision
+    return nothing
+end
+
+"""
+Build the OrdinaryDiffEq problem for the periodic advection case.
+
+The default returns one ODEProblem for transport plus the high-order
+quadrature collision. With split=true, collision is the implicit component
+and transport is the explicit component of a SplitODEProblem. The split mode
+defaults to equilibrium projection because its discrete equilibrium manifold
+is the one used by the formal AP analysis in the manuscript.
+"""
+function advection_ode_problem(;
+    split=false,
+    collision_discretization=nothing,
+    kwargs...,
+)
+    selected_collision = if isnothing(collision_discretization)
+        split ? :equilibrium_projection : :quadrature
+    else
+        collision_discretization
+    end
+    selected_collision in (:quadrature, :equilibrium_projection) ||
+        throw(ArgumentError(
+            "collision_discretization must be :quadrature or " *
+            ":equilibrium_projection",
+        ))
+
+    ks = create_solver(; kwargs...)
+    ctr, face = initialize_solution(ks)
+    initial_state = pack_advection_state(ks, ctr, face)
+    parameters = AdvectionRHSParameters(ks)
+    time_span = (0.0, ks.set.maxTime)
+
+    problem = if split
+        collision_rhs! = selected_collision === :quadrature ?
+                         advection_collision_rhs! :
+                         advection_equilibrium_collision_rhs!
+        SplitODEProblem(
+            collision_rhs!,
+            advection_transport_rhs!,
+            initial_state,
+            time_span,
+            parameters,
+        )
+    else
+        combined_rhs! = selected_collision === :quadrature ?
+                        advection_bgk_rhs! : advection_ap_bgk_rhs!
+        ODEProblem(combined_rhs!, initial_state, time_span, parameters)
+    end
+    return (; problem, ks, ctr, face, parameters, selected_collision)
+end
+
+"""
+Solve the periodic BGK advection case through OrdinaryDiffEq.
+
+Tsit5 is the default for the finite-Knudsen unsplit problem. Setting split=true
+selects the stiffly accurate KenCarp4 IMEX method unless another algorithm is
+provided. In both cases dtmax enforces the molecular transport CFL; explicit
+integration may impose a smaller collision time step. The returned solution
+object exposes accepted/rejected steps and can be inspected with the standard
+SciML tooling.
+"""
+function solve_advection_active_flux(;
+    split=false,
+    algorithm=nothing,
+    collision_discretization=nothing,
+    reltol=1e-7,
+    abstol=1e-9,
+    kwargs...,
+)
+    setup = advection_ode_problem(;
+        split,
+        collision_discretization,
+        kwargs...,
+    )
+    ks = setup.ks
+    initial_total = global_conserved(ks, setup.ctr)
+    transport_dt = ks.set.cfl * minimum(ks.ps.dx[1:ks.ps.nx]) /
+                   maximum(abs, ks.vs.u)
+    selected_algorithm = if isnothing(algorithm)
+        split ? KenCarp4() : Tsit5()
+    else
+        algorithm
+    end
+
+    solution = solve(
+        setup.problem,
+        selected_algorithm;
+        dt=transport_dt,
+        dtmax=transport_dt,
+        reltol,
+        abstol,
+        save_everystep=false,
+    )
+    unpack_advection_state!(last(solution.u), ks, setup.ctr, setup.face)
+    stats = diagnostics(ks, setup.ctr, setup.face, initial_total)
+    return (;
+        ks,
+        ctr=setup.ctr,
+        face=setup.face,
+        time=last(solution.t),
+        steps=solution.destats.naccept,
+        stats,
+        solution,
+        algorithm=selected_algorithm,
+        formulation=:ordinarydiffeq,
+        split,
+        collision_discretization=setup.selected_collision,
+    )
+end
+
 """Plot the initial and final density, velocity, and pressure."""
 function plot_solution(result)
     ks, ctr = result.ks, result.ctr
@@ -487,7 +817,7 @@ function print_diagnostics(result)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    result = solve_bgk_active_flux()
+    result = solve_advection_active_flux()
     print_diagnostics(result)
     display(plot_solution(result))
 end
