@@ -29,12 +29,29 @@ function run_sod_simulation(;
     output_path=joinpath(
         DEFAULT_SOD_DATA_DIRECTORY, sod_data_filename(knudsen),
     ),
+    progress_interval=10,
     kwargs...,
 )
-    result = solve_sod_active_flux(; knudsen, kwargs...)
+    println("Starting full-Boltzmann Sod simulation")
+    println("  Knudsen number: ", knudsen)
+    println("  Julia threads: ", Threads.nthreads())
+    println("  output: ", abspath(output_path))
+    flush(stdout)
+    result = solve_sod_active_flux(;
+        knudsen,
+        progress_interval,
+        kwargs...,
+    )
     data = sod_result_data(result)
     mkpath(dirname(output_path))
-    JLD2.jldsave(output_path, true; result=data)
+    temporary_path = output_path * ".partial-$(getpid())"
+    try
+        JLD2.jldsave(temporary_path, true; result=data)
+        mv(temporary_path, output_path; force=true)
+    catch
+        isfile(temporary_path) && rm(temporary_path)
+        rethrow()
+    end
 
     print_sod_diagnostics(result)
     println("  saved JLD2 result: ", abspath(output_path))

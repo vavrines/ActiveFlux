@@ -363,8 +363,8 @@ end
 
 """Build the KitBase data for the `1d1f3v` full-Boltzmann Sod problem."""
 function create_sod_solver(;
-    nx=50,
-    nu=28,
+    nx=100,
+    nu=64,
     nv=28,
     nw=28,
     knudsen=1e-4,
@@ -1184,6 +1184,7 @@ function solve_sod_active_flux(;
     limiter=:macroscopic_local,
     sensor_smooth=0.08,
     sensor_nonsmooth=0.50,
+    progress_interval=0,
     kwargs...,
 )
     0 < penalty_alpha < 1 || throw(ArgumentError(
@@ -1192,6 +1193,9 @@ function solve_sod_active_flux(;
     limiter = sod_limiter_mode(limiter)
     0 <= sensor_smooth < sensor_nonsmooth <= 1 || throw(ArgumentError(
         "sensor thresholds must satisfy 0 <= smooth < nonsmooth <= 1",
+    ))
+    progress_interval >= 0 || throw(ArgumentError(
+        "progress_interval must be nonnegative",
     ))
     ks = create_sod_solver(; kwargs...)
     workspace = create_sod_collision_workspace(ks)
@@ -1258,6 +1262,16 @@ function solve_sod_active_flux(;
             )
             time += dt
             steps += 1
+            if progress_interval > 0 &&
+               (steps % progress_interval == 0 || time >= ks.set.maxTime)
+                println(
+                    "  progress: step=$steps, t=",
+                    round(time; digits=8),
+                    "/",
+                    ks.set.maxTime,
+                )
+                flush(stdout)
+            end
         end
     end
 

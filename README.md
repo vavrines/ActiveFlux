@@ -74,19 +74,26 @@ can be replaced through the `algorithm` keyword. An AP-oriented split problem
 and `KenCarp4` driver remain available through
 `solve_advection_active_flux(split=true)`.
 
-Run the three active-flux full-Boltzmann Sod simulations with four Julia
-threads and then plot their saved results with:
+The three production Sod simulations have independent entry points so they can
+be submitted as separate remote jobs. From the repository root, run:
 
 ```shell
-julia --threads=4 --project=. src/sod_simulation.jl
-julia --project=. src/sod_plot.jl
+mkdir -p remote_results
+julia --threads=4 --project=. src/sod_kn1e-4.jl remote_results
+julia --threads=4 --project=. src/sod_kn1e-2.jl remote_results
+julia --threads=4 --project=. src/sod_kn1.jl remote_results
 ```
 
+Each command may be executed in a different scheduler job. Do not start all
+three simultaneously on one node unless it has at least 12 allocated CPU
+threads and enough memory for three FSM kernels. The original
+`src/sod_simulation.jl` entry point remains available when a sequential
+three-case run is preferred.
+
 The shock-tube solver uses `1d1f3v`, `K=0`, `γ=5/3`, and kinetic
-inflow/outflow boundaries. Its current coarse-run defaults are `nx=50`
-physical cells
-(101 globally independent active-flux degrees of freedom, or 150 cell-local
-average/endpoint entries) and a `28×28×28` molecular-velocity grid. The
+inflow/outflow boundaries. Its production defaults are `nx=100` physical cells
+(201 globally independent active-flux degrees of freedom, or 300 cell-local
+average/endpoint entries) and a `64×28×28` molecular-velocity grid. The
 complete Boltzmann collision integral is
 evaluated by the fast spectral method at four reconstructed physical
 quadrature points per cell and at every active-flux interface point. A
@@ -105,13 +112,24 @@ physical domain. The solver also retains `limiter=:none` and
 `limiter=:legacy` for controlled comparisons; `:none` is diagnostic only
 because unlimited interface values can become negative before collision.
 
-The first command writes the full states and numerical/exact profiles to
-`data/sod_kn1e-4.jld2`, `data/sod_kn1e-2.jld2`, and
-`data/sod_kn1.jld2`. The second command reads only those files and writes the
+The three commands write the full states and numerical/exact profiles to
+`remote_results/sod_kn1e-4.jld2`, `remote_results/sod_kn1e-2.jld2`, and
+`remote_results/sod_kn1.jld2`. Results are first written to a process-specific
+partial file and atomically renamed only after JLD2 serialization succeeds.
+Progress is flushed to standard output every ten time steps, making batch logs
+useful while the FSM calculation runs.
+
+After copying those three files back into the local `data/` directory, run:
+
+```shell
+julia --project=. src/sod_plot.jl
+```
+
+The plotting program reads only those files and writes the
 density, velocity, pressure, and heat-flux comparison to
-`tex/figures/sod-shock-tube.pdf`. An optional argument to the simulation
-program selects the output directory. The plotting program optionally accepts
-the three input paths followed by its output path. The solver implementation
+`tex/figures/sod-shock-tube.pdf`. It rejects mixed physical grids, velocity
+grids, limiter settings, or FSM parameters. The plotting program optionally
+accepts the three input paths followed by its output path. The solver implementation
 in `src/sod.jl` is self-contained at the case level: it defines its own
 active-flux states, FSM collision workspace, quadrature data, boundaries, and
 time-step routine and does not include `advection.jl` or another example. Each
@@ -125,16 +143,16 @@ an unlimited undershoot.
 The reconstructed cell collisions and active-flux interface collisions use
 `Threads.@threads`. Each worker owns independent reconstruction arrays, FSM
 temporaries, and conservative-projection storage; the spectral kernel is
-read-only and shared. Launching Julia with `--threads=4` is therefore required
-to obtain the intended four-thread execution. To compute only the preliminary
-small-Knudsen result, use:
+read-only and shared. Launching Julia with `--threads=4` selects the tested
+four-thread execution; a different positive thread count may be used when it
+matches the remote scheduler allocation. To plot only the small-Knudsen result
+against Euler after its job finishes, use:
 
 ```shell
-julia --threads=4 --project=. -e 'include("src/sod_simulation.jl"); run_sod_simulation(knudsen=1e-4)'
-julia --project=. -e 'include("src/sod_plot.jl"); plot_sod_continuum_check()'
+julia --project=. -e 'include("src/sod_plot.jl"); plot_sod_continuum_check(data_path="remote_results/sod_kn1e-4.jld2")'
 ```
 
-The second command writes the density, velocity, and pressure comparison with
+This command writes the density, velocity, and pressure comparison with
 the exact Euler Riemann solution to
 `tex/figures/sod-continuum-check.png` without repeating the simulation.
 
@@ -146,7 +164,21 @@ julia --threads=4 --project=. -e 'include("src/sod_simulation.jl"); run_sod_limi
 ```
 
 Its three JLD2 files are written under `data/limiter_comparison/`. These data
-must not replace the `28×28×28` results used for Figure 4.
+must not replace the `64×28×28` results used for Figure 4.
+
+On a newly prepared remote checkout, instantiate and precompile the Julia
+environment before submitting the jobs:
+
+```shell
+julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+```
+
+One possible synchronization command, executed on the local machine after all
+three jobs finish, is:
+
+```shell
+rsync -av user@server:/path/to/ActiveFlux/remote_results/sod_kn*.jld2 data/
+```
 
 Case 3 is split into two independent simulations and a lightweight plotting
 step so that the expensive full-Boltzmann result can be reused:

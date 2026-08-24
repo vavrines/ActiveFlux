@@ -51,10 +51,28 @@ end
 
 """Build the three-Knudsen comparison solely from saved profile arrays."""
 function plot_saved_sod(data_sets)
-    first_profile = first(data_sets)["profile"]
+    first_data = first(data_sets)
+    first_profile = first_data["profile"]
     x = first_profile["x"]
+    reference_parameters = first_data["parameters"]
+    reference_grid = first_data["grid"]
     for data in data_sets
         data["profile"]["x"] == x || error("Sod physical grids differ")
+        parameters = data["parameters"]
+        for key in (
+            "nx", "nu", "nv", "nw", "x0", "x1", "gamma", "cfl",
+            "fsm_modes", "alpha", "omega", "transport_limiter",
+            "sensor_smooth", "sensor_nonsmooth",
+        )
+            parameters[key] == reference_parameters[key] || error(
+                "Sod parameter '$key' differs across saved results",
+            )
+        end
+        for key in ("u", "v", "w")
+            data["grid"][key] == reference_grid[key] || error(
+                "Sod velocity grid '$key' differs across saved results",
+            )
+        end
     end
 
     fields = ("density", "velocity", "pressure", "heat_flux")
