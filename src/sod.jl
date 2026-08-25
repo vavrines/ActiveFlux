@@ -31,7 +31,8 @@ from that saved result without repeating the kinetic calculation.
 using KitBase
 using KitBase.OffsetArrays
 using LinearAlgebra
-using OrdinaryDiffEq: ODEProblem, SSPRK33, solve
+using OrdinaryDiffEq:
+    ODEProblem, SSPRK33, init, reinit!, set_proposed_dt!, solve!
 using Base.Threads: @threads, maxthreadid, nthreads, threadid
 
 # Four-point Gauss--Legendre quadrature is used both for the positivity-limited
@@ -95,8 +96,9 @@ mutable struct SodCollisionThreadCache{TW,TP,TA}
 end
 
 """All thread-local collision data plus a reduction buffer."""
-struct SodCollisionThreadPool{TC,TR}
+struct SodCollisionThreadPool{TC,TI,TR}
     caches::TC
+    thread_slots::TI
     residuals::TR
 end
 
@@ -143,10 +145,10 @@ Allocate one independent collision cache for every Julia thread.
 
 The FSM routines and the conservative moment projection mutate their
 workspace. Sharing one instance inside `@threads` would therefore introduce a
-race even though different physical cells are being updated. Thread one reuses
-the solver's primary workspace; all other threads receive a complete private
-copy of the mutable arrays while sharing only the read-only spectral kernel in
-`ks`.
+race even though different physical cells are being updated. One active worker
+reuses the solver's primary workspace; all other active workers receive a
+complete private copy of the mutable arrays while sharing only the read-only
+spectral kernel in `ks`.
 """
 function create_sod_collision_thread_pool(ks, primary_workspace)
     make_cache(workspace) = SodCollisionThreadCache(
@@ -159,16 +161,35 @@ function create_sod_collision_thread_pool(ks, primary_workspace)
         similar(ks.vs.u),
         similar(ks.vs.u),
     )
+    # Thread IDs need not be 1:nthreads(). For example, a Julia process with
+    # an interactive thread pool can use IDs 2:5 for four default workers while
+    # maxthreadid() is eight. Discover the IDs that a static default-pool loop
+    # actually uses and allocate expensive FSM workspaces only for them.
+    worker_ids = Vector{Int}(undef, nthreads())
+    @threads :static for slot in eachindex(worker_ids)
+        worker_ids[slot] = threadid()
+    end
+    length(unique(worker_ids)) == length(worker_ids) || error(
+        "static collision workers did not receive unique thread IDs",
+    )
+
     first_cache = make_cache(primary_workspace)
-    caches = Vector{typeof(first_cache)}(undef, maxthreadid())
+    caches = Vector{typeof(first_cache)}(undef, length(worker_ids))
     caches[1] = first_cache
     for tid in 2:length(caches)
         workspace = create_sod_collision_workspace(ks)
         caches[tid] = make_cache(workspace)
     end
+    thread_slots = zeros(Int, maxthreadid())
+    for (slot, tid) in pairs(worker_ids)
+        thread_slots[tid] = slot
+    end
     return SodCollisionThreadPool(
         caches,
-        zeros(eltype(ks.vs.u), length(caches)),
+        thread_slots,
+        # Put one reduction value on each cache line to avoid false sharing
+        # when several collision workers finish cells at the same time.
+        zeros(eltype(ks.vs.u), 8, length(caches)),
     )
 end
 
@@ -530,7 +551,7 @@ function initialize_sod_solution(ks, workspace)
         update_sod_macroscopic!(ctr[i], ks, workspace)
     end
 
-    for i in 1:nx+1
+    for i in 1:(nx+1)
         xface = ks.ps.x0 + (i - 1) * ks.ps.dx[1]
         if xface < discontinuity
             face[i].f .= left_distribution
@@ -664,23 +685,25 @@ function sod_collision_step!(
     fill!(pool.residuals, 0)
 
     @threads :static for i in 1:ks.ps.nx
-        tid = threadid()
+        slot = pool.thread_slots[threadid()]
+        slot > 0 || error("missing Sod collision cache for active thread")
         residual = sod_collision_cell!(
-            pool.caches[tid], ks, ctr, face, i, dt, penalty_alpha,
+            pool.caches[slot], ks, ctr, face, i, dt, penalty_alpha,
         )
-        pool.residuals[tid] = max(pool.residuals[tid], residual)
+        pool.residuals[1, slot] = max(pool.residuals[1, slot], residual)
     end
     maximum_collision_residual = maximum(pool.residuals)
 
     fill!(pool.residuals, 0)
     # Unlike the periodic wave, the shock tube has nx+1 distinct physical
     # interfaces; each is relaxed before incoming reservoir data are restored.
-    @threads :static for i in 1:ks.ps.nx+1
-        tid = threadid()
+    @threads :static for i in 1:(ks.ps.nx+1)
+        slot = pool.thread_slots[threadid()]
+        slot > 0 || error("missing Sod collision cache for active thread")
         residual = sod_collision_interface!(
-            pool.caches[tid], ks, face, i, dt, penalty_alpha,
+            pool.caches[slot], ks, face, i, dt, penalty_alpha,
         )
-        pool.residuals[tid] = max(pool.residuals[tid], residual)
+        pool.residuals[1, slot] = max(pool.residuals[1, slot], residual)
     end
     maximum_collision_residual = max(
         maximum_collision_residual,
@@ -740,7 +763,7 @@ function sod_macroscopic_jump_blend(
 end
 
 """Parameters of the case-specific semi-discrete Sod transport operator."""
-struct SodTransportParameters{KS,TV,TL,TR,TM,TMM,TS,TPR,T}
+mutable struct SodTransportParameters{KS,TV,TL,TR,TM,TMM,TS,TPR,T}
     ks::KS
     velocity_x::TV
     left_distribution::TL
@@ -757,6 +780,13 @@ struct SodTransportParameters{KS,TV,TL,TR,TM,TMM,TS,TPR,T}
     sensor_smooth::T
     sensor_nonsmooth::T
     step_size::T
+end
+
+"""Persistent packed state, scratch arrays, and OrdinaryDiffEq integrator."""
+struct SodTransportCache{TS,TP,TI}
+    packed_state::TS
+    parameters::TP
+    integrator::TI
 end
 
 """Recover density and pressure from one discrete distribution column."""
@@ -785,16 +815,27 @@ Pack nx cell averages and nx+1 distinct shock-tube interface values.
 Unlike the periodic advection case, the left and right boundary interfaces are
 different degrees of freedom, so the packed state has 2nx+1 columns.
 """
-function pack_sod_state(ks, ctr, face)
+function pack_sod_state!(state, ks, ctr, face)
     nvelocity = length(ks.vs.u)
-    state = zeros(eltype(ctr[1].f), nvelocity, 2 * ks.ps.nx + 1)
-    @threads :static for i in 1:ks.ps.nx
-        @views state[:, i] .= vec(ctr[i].f)
-    end
+    size(state) == (nvelocity, 2 * ks.ps.nx + 1) || throw(
+        DimensionMismatch("invalid packed Sod state size $(size(state))"),
+    )
+    # Pack both kinds of active-flux degrees of freedom in one worker region;
+    # the final iteration owns only the right boundary interface.
     @threads :static for i in 1:(ks.ps.nx+1)
+        if i <= ks.ps.nx
+            @views state[:, i] .= vec(ctr[i].f)
+        end
         @views state[:, ks.ps.nx+i] .= vec(face[i].f)
     end
     return state
+end
+
+function pack_sod_state(ks, ctr, face)
+    state = zeros(
+        eltype(ctr[1].f), length(ks.vs.u), 2 * ks.ps.nx + 1,
+    )
+    return pack_sod_state!(state, ks, ctr, face)
 end
 
 """Copy the final Runge--Kutta state back and restore kinetic reservoirs."""
@@ -812,10 +853,12 @@ function unpack_sod_state!(
     size(state) == (length(ks.vs.u), 2 * nx + 1) ||
         throw(DimensionMismatch("invalid packed Sod state size $(size(state))"))
 
-    @threads :static for i in 1:nx
-        ctr[i].f .= reshape(@view(state[:, i]), shape)
-    end
+    # Cell and interface distributions are disjoint, so one worker region can
+    # restore both and avoids a second launch/barrier on every Strang step.
     @threads :static for i in 1:(nx+1)
+        if i <= nx
+            ctr[i].f .= reshape(@view(state[:, i]), shape)
+        end
         face[i].f .= reshape(@view(state[:, nx+i]), shape)
         face[i].favg .= face[i].f
     end
@@ -826,7 +869,7 @@ function unpack_sod_state!(
     for i in 1:nx
         update_sod_macroscopic!(ctr[i], ks, workspace)
     end
-    for i in 1:nx+1
+    for i in 1:(nx+1)
         update_sod_macroscopic!(face[i], ks, workspace)
     end
     apply_sod_boundary!(
@@ -847,6 +890,21 @@ end
         return i == 1 ? parameters.left_distribution[j] : state[j, i-1]
     end
     return i == nx + 1 ? parameters.right_distribution[j] : state[j, i]
+end
+
+"""Apply the two neighboring cell bounds to one raw antidiffusive face."""
+@inline function sod_local_limited_face(parameters, j, i, scale)
+    low_value = parameters.low_face[j, i]
+    correction = parameters.limited_face[j, i] - low_value
+    alpha = 1.0
+    nx = parameters.ks.ps.nx
+    if i > 1 && -scale * correction < 0
+        alpha = min(alpha, parameters.positivity_ratio[j, i-1])
+    end
+    if i <= nx && scale * correction < 0
+        alpha = min(alpha, parameters.positivity_ratio[j, i])
+    end
+    return low_value + alpha * correction
 end
 
 """
@@ -875,7 +933,8 @@ function sod_transport_rhs!(derivative, state, parameters, time)
     dt = parameters.step_size
     size(state) == (nvelocity, 2 * nx + 1) ||
         throw(DimensionMismatch("invalid packed Sod state size $(size(state))"))
-    fill!(derivative, zero(eltype(derivative)))
+    # Every cell and interface column is assigned in the final threaded pass,
+    # so clearing this phase-space-sized array here would be redundant traffic.
 
     low_face = parameters.low_face
     limited_face = parameters.limited_face
@@ -917,7 +976,7 @@ function sod_transport_rhs!(derivative, state, parameters, time)
                 parameters.moment_matrix,
                 ks.gas.γ,
             )
-        for i in 1:nx+1
+        for i in 1:(nx+1)
             parameters.face_blend[i] = sod_macroscopic_jump_blend(
                 parameters.density[i],
                 parameters.pressure[i],
@@ -978,7 +1037,7 @@ function sod_transport_rhs!(derivative, state, parameters, time)
                 end
             end
             if correction_scale < 1
-                for i in 1:nx+1
+                for i in 1:(nx+1)
                     limited_face[j, i] = low_face[j, i] + correction_scale *
                                          (limited_face[j, i] - low_face[j, i])
                 end
@@ -992,14 +1051,13 @@ function sod_transport_rhs!(derivative, state, parameters, time)
         # Unlike the legacy scalar, this coefficient never propagates a shock
         # restriction to unrelated faces elsewhere in the domain.
         safety = 0.999999999999
-        @threads :static for j in 1:nvelocity
-            # The positivity ratios are overwritten for every velocity. A
-            # thread-private row prevents races while avoiding an
-            # nvelocity-by-nx scratch array.
-            ratio = @view parameters.positivity_ratio[threadid(), :]
-            velocity = parameters.velocity_x[j]
-            scale = dt * velocity / dx
-            for i in 1:nx
+        # Store one ratio per phase-space cell. Threading over physical cells
+        # keeps the molecular-velocity loop contiguous in column-major storage
+        # and removes the formerly strided velocity-owned scan over x.
+        @threads :static for i in 1:nx
+            for j in 1:nvelocity
+                velocity = parameters.velocity_x[j]
+                scale = dt * velocity / dx
                 low_rhs = -velocity / dx *
                           (low_face[j, i+1] - low_face[j, i])
                 low_candidate = max(state[j, i] + dt * low_rhs, 0.0)
@@ -1009,38 +1067,31 @@ function sod_transport_rhs!(derivative, state, parameters, time)
                     (limited_face[j, i+1] - low_face[j, i+1])
                 loss = -min(left_contribution, 0.0) -
                        min(right_contribution, 0.0)
-                ratio[i] = loss > 0 ?
-                           min(1.0, safety * low_candidate / loss) : 1.0
-            end
-
-            for i in 1:nx+1
-                correction = limited_face[j, i] - low_face[j, i]
-                alpha = 1.0
-                # This face is the right boundary of cell i-1.
-                if i > 1 && -scale * correction < 0
-                    alpha = min(alpha, ratio[i-1])
-                end
-                # This face is the left boundary of cell i.
-                if i <= nx && scale * correction < 0
-                    alpha = min(alpha, ratio[i])
-                end
-                limited_face[j, i] = low_face[j, i] + alpha * correction
+                parameters.positivity_ratio[j, i] = loss > 0 ?
+                    min(1.0, safety * low_candidate / loss) : 1.0
             end
         end
     end
 
-    # Conservative cell-average RHS using the limited kinetic face states.
-    @threads :static for i in 1:nx
-        for j in 1:nvelocity
-            derivative[j, i] = -parameters.velocity_x[j] / dx *
-                               (limited_face[j, i+1] - limited_face[j, i])
-        end
-    end
-
-    # Semi-discrete evolution of the additional interface point values.
+    # Finish the conservative cell component and the additional point-value
+    # component in one threaded region. In the local limiter mode the final
+    # face values are formed on demand from the completed cell ratios, avoiding
+    # a separate face-correction pass and one additional thread barrier.
     @threads :static for i in 1:(nx+1)
         for j in 1:nvelocity
             velocity = parameters.velocity_x[j]
+            scale = dt * velocity / dx
+            if i <= nx
+                left_face = limiter === :macroscopic_local ?
+                    sod_local_limited_face(parameters, j, i, scale) :
+                    limited_face[j, i]
+                right_face = limiter === :macroscopic_local ?
+                    sod_local_limited_face(parameters, j, i+1, scale) :
+                    limited_face[j, i+1]
+                derivative[j, i] = -velocity / dx *
+                                   (right_face - left_face)
+            end
+
             point_column = sod_interface_column(parameters, i)
             incoming = (i == 1 && velocity >= 0) ||
                        (i == nx + 1 && velocity < 0)
@@ -1083,7 +1134,105 @@ function sod_transport_rhs!(derivative, state, parameters, time)
     return nothing
 end
 
-"""Advance one transport interval with an OrdinaryDiffEq Runge--Kutta solve."""
+"""Allocate the transport work arrays and OrdinaryDiffEq integrator once."""
+function create_sod_transport_cache(
+    ks,
+    ctr,
+    face,
+    left_distribution,
+    right_distribution,
+    workspace,
+    dt;
+    algorithm=SSPRK33(),
+    limiter=:macroscopic_local,
+    sensor_smooth=0.08,
+    sensor_nonsmooth=0.50,
+)
+    limiter = sod_limiter_mode(limiter)
+    0 <= sensor_smooth < sensor_nonsmooth <= 1 || throw(ArgumentError(
+        "sensor thresholds must satisfy 0 <= smooth < nonsmooth <= 1",
+    ))
+    packed_state = pack_sod_state(ks, ctr, face)
+    moment_matrix = permutedims(
+        workspace.invariants .* reshape(workspace.weights, :, 1),
+    )
+    parameters = SodTransportParameters(
+        ks,
+        collect(vec(ks.vs.u)),
+        collect(vec(left_distribution)),
+        collect(vec(right_distribution)),
+        zeros(eltype(packed_state), length(ks.vs.u), ks.ps.nx + 1),
+        zeros(eltype(packed_state), length(ks.vs.u), ks.ps.nx + 1),
+        moment_matrix,
+        zeros(eltype(packed_state), 5, ks.ps.nx),
+        zeros(eltype(packed_state), ks.ps.nx + 2),
+        zeros(eltype(packed_state), ks.ps.nx + 2),
+        ones(eltype(packed_state), ks.ps.nx + 1),
+        ones(eltype(packed_state), length(ks.vs.u), ks.ps.nx),
+        limiter,
+        sensor_smooth,
+        sensor_nonsmooth,
+        dt,
+    )
+    problem = ODEProblem(
+        sod_transport_rhs!,
+        packed_state,
+        (zero(dt), dt),
+        parameters,
+    )
+    integrator = init(
+        problem,
+        algorithm;
+        adaptive=false,
+        dt,
+        save_everystep=false,
+        save_start=false,
+        save_end=false,
+        dense=false,
+    )
+    return SodTransportCache(packed_state, parameters, integrator)
+end
+
+"""Advance one interval by reusing a persistent OrdinaryDiffEq integrator."""
+function sod_transport_rk_step!(
+    ks,
+    ctr,
+    face,
+    dt,
+    left_distribution,
+    right_distribution,
+    workspace,
+    cache::SodTransportCache,
+)
+    pack_sod_state!(cache.packed_state, ks, ctr, face)
+    cache.parameters.step_size = dt
+    reinit!(
+        cache.integrator,
+        cache.packed_state;
+        t0=zero(dt),
+        tf=dt,
+        erase_sol=true,
+        reset_dt=false,
+        reinit_dae=false,
+        reinit_callbacks=false,
+        initialize_save=false,
+        reinit_cache=true,
+    )
+    set_proposed_dt!(cache.integrator, dt)
+    solve!(cache.integrator)
+    unpack_sod_state!(
+        cache.integrator.u,
+        ks,
+        ctr,
+        face,
+        left_distribution,
+        right_distribution,
+        workspace,
+    )
+    return cache.integrator
+end
+
+"""Allocate a temporary cache for a standalone one-interval transport call."""
 function sod_transport_rk_step!(
     ks,
     ctr,
@@ -1097,55 +1246,29 @@ function sod_transport_rk_step!(
     sensor_smooth=0.08,
     sensor_nonsmooth=0.50,
 )
-    limiter = sod_limiter_mode(limiter)
-    0 <= sensor_smooth < sensor_nonsmooth <= 1 || throw(ArgumentError(
-        "sensor thresholds must satisfy 0 <= smooth < nonsmooth <= 1",
-    ))
-    initial_state = pack_sod_state(ks, ctr, face)
-    moment_matrix = permutedims(
-        workspace.invariants .* reshape(workspace.weights, :, 1),
-    )
-    parameters = SodTransportParameters(
-        ks,
-        collect(vec(ks.vs.u)),
-        collect(vec(left_distribution)),
-        collect(vec(right_distribution)),
-        zeros(eltype(initial_state), length(ks.vs.u), ks.ps.nx + 1),
-        zeros(eltype(initial_state), length(ks.vs.u), ks.ps.nx + 1),
-        moment_matrix,
-        zeros(eltype(initial_state), 5, ks.ps.nx),
-        zeros(eltype(initial_state), ks.ps.nx + 2),
-        zeros(eltype(initial_state), ks.ps.nx + 2),
-        ones(eltype(initial_state), ks.ps.nx + 1),
-        ones(eltype(initial_state), maxthreadid(), ks.ps.nx),
-        limiter,
-        sensor_smooth,
-        sensor_nonsmooth,
-        dt,
-    )
-    problem = ODEProblem(
-        sod_transport_rhs!,
-        initial_state,
-        (zero(dt), dt),
-        parameters,
-    )
-    solution = solve(
-        problem,
-        algorithm;
-        adaptive=false,
-        dt,
-        save_everystep=false,
-    )
-    unpack_sod_state!(
-        last(solution.u),
+    cache = create_sod_transport_cache(
         ks,
         ctr,
         face,
         left_distribution,
         right_distribution,
         workspace,
+        dt;
+        algorithm,
+        limiter,
+        sensor_smooth,
+        sensor_nonsmooth,
     )
-    return solution
+    return sod_transport_rk_step!(
+        ks,
+        ctr,
+        face,
+        dt,
+        left_distribution,
+        right_distribution,
+        workspace,
+        cache,
+    )
 end
 
 """
@@ -1225,6 +1348,19 @@ function solve_sod_active_flux(;
     collision_thread_pool = create_sod_collision_thread_pool(ks, workspace)
     ctr, face, left_distribution, right_distribution =
         initialize_sod_solution(ks, workspace)
+    transport_cache = create_sod_transport_cache(
+        ks,
+        ctr,
+        face,
+        left_distribution,
+        right_distribution,
+        workspace,
+        sod_active_flux_timestep(ks, 0.0);
+        algorithm,
+        limiter,
+        sensor_smooth,
+        sensor_nonsmooth,
+    )
 
     time = 0.0
     steps = 0
@@ -1255,11 +1391,8 @@ function solve_sod_active_flux(;
                 dt,
                 left_distribution,
                 right_distribution,
-                workspace;
-                algorithm,
-                limiter,
-                sensor_smooth,
-                sensor_nonsmooth,
+                workspace,
+                transport_cache,
             )
             minimum_transport_cell_distribution = min(
                 minimum_transport_cell_distribution,
@@ -1267,7 +1400,7 @@ function solve_sod_active_flux(;
             )
             minimum_transport_interface_distribution = min(
                 minimum_transport_interface_distribution,
-                minimum(minimum(face[i].f) for i in 1:ks.ps.nx+1),
+                minimum(minimum(face[i].f) for i in 1:(ks.ps.nx+1)),
             )
             residual = sod_collision_step!(
                 ks,
@@ -1406,7 +1539,7 @@ function sod_result_data(result)
         @views conservative[:, i] .= ctr[i].w
         @views primitive[:, i] .= ctr[i].prim
     end
-    for i in 1:nx+1
+    for i in 1:(nx+1)
         @views interface_distribution[:, :, :, i] .= face[i].f
     end
 

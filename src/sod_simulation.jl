@@ -4,8 +4,9 @@ Run the active-flux full-Boltzmann Sod simulations and save JLD2 results.
 The default program executes the three reference Knudsen numbers `1e-4`,
 `1e-2`, and `1`, writing one file immediately after each calculation. Pass an
 optional first command-line argument to change the output directory. The
-plotting stack is not loaded by this program. Launch Julia with `--threads=4`
-to use four thread-private FSM collision workers.
+plotting stack is not loaded by this program. Launch with
+`OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4` so that four Julia
+workers own the phase-space loops without a nested BLAS/OpenMP thread team.
 """
 
 include(joinpath(@__DIR__, "sod.jl"))
@@ -35,6 +36,7 @@ function run_sod_simulation(;
     println("Starting full-Boltzmann Sod simulation")
     println("  Knudsen number: ", knudsen)
     println("  Julia threads: ", Threads.nthreads())
+    println("  BLAS threads: ", BLAS.get_num_threads())
     println("  output: ", abspath(output_path))
     flush(stdout)
     result = solve_sod_active_flux(;

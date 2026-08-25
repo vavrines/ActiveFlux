@@ -25,7 +25,8 @@ JLD2 results without repeating either simulation.
 using KitBase
 using KitBase.OffsetArrays
 using LinearAlgebra
-using OrdinaryDiffEq: Euler, ODEProblem, solve
+using OrdinaryDiffEq:
+    Euler, ODEProblem, init, reinit!, set_proposed_dt!, solve!
 using Base.Threads: @threads, maxthreadid, nthreads, threadid
 
 # Four Gauss--Legendre points are enough to integrate the quadratic active-flux
@@ -99,13 +100,14 @@ mutable struct ShockCollisionThreadCache{TW,TP,TA}
 end
 
 """Collision caches for all Julia threads and a reduction buffer."""
-struct ShockCollisionThreadPool{TC,TR}
+struct ShockCollisionThreadPool{TC,TI,TR}
     caches::TC
+    thread_slots::TI
     residuals::TR
 end
 
 """Parameters and scratch arrays of the semi-discrete transport operator."""
-struct NormalShockTransportParameters{KS,TV,TM,T}
+mutable struct NormalShockTransportParameters{KS,TV,TM,T}
     ks::KS
     velocity_x::TV
     left_distribution::TV
@@ -113,6 +115,13 @@ struct NormalShockTransportParameters{KS,TV,TM,T}
     low_face::TM
     limited_face::TM
     step_size::T
+end
+
+"""Persistent packed state, scratch arrays, and OrdinaryDiffEq integrator."""
+struct NormalShockTransportCache{TS,TP,TI}
+    packed_state::TS
+    parameters::TP
+    integrator::TI
 end
 
 """Return the upstream and downstream monatomic Rankine--Hugoniot states."""
@@ -273,15 +282,28 @@ function create_shock_collision_thread_pool(ks, primary_workspace)
         similar(ks.vs.u),
         similar(ks.vs.u),
     )
+    worker_ids = Vector{Int}(undef, nthreads())
+    @threads :static for slot in eachindex(worker_ids)
+        worker_ids[slot] = threadid()
+    end
+    length(unique(worker_ids)) == length(worker_ids) || error(
+        "static shock-collision workers did not receive unique thread IDs",
+    )
+
     first_cache = make_cache(primary_workspace)
-    caches = Vector{typeof(first_cache)}(undef, maxthreadid())
+    caches = Vector{typeof(first_cache)}(undef, length(worker_ids))
     caches[1] = first_cache
     for tid in 2:length(caches)
         caches[tid] = make_cache(create_shock_collision_workspace(ks))
     end
+    thread_slots = zeros(Int, maxthreadid())
+    for (slot, tid) in pairs(worker_ids)
+        thread_slots[tid] = slot
+    end
     return ShockCollisionThreadPool(
         caches,
-        zeros(eltype(ks.vs.u), length(caches)),
+        thread_slots,
+        zeros(eltype(ks.vs.u), 8, length(caches)),
     )
 end
 
@@ -492,7 +514,7 @@ function initialize_normal_shock_solution(ks, workspace; initial_width=2.0)
         update_shock_macroscopic!(ctr[i], ks, workspace)
     end
 
-    for i in 1:nx+1
+    for i in 1:(nx+1)
         xface = ks.ps.x0 + (i - 1) * ks.ps.dx[1]
         blend = shock_blending_fraction(xface, initial_width)
         @. face[i].f = (1 - blend) * left_distribution +
@@ -507,18 +529,27 @@ function initialize_normal_shock_solution(ks, workspace; initial_width=2.0)
     return ctr, face, left_distribution, right_distribution
 end
 
-"""Pack cell averages and interface values into an OrdinaryDiffEq state."""
-function pack_normal_shock_state(ks, ctr, face)
+"""Pack cell averages and interface values into preallocated ODE storage."""
+function pack_normal_shock_state!(state, ks, ctr, face)
     nvelocity = length(ks.vs.u)
     nx = ks.ps.nx
-    state = zeros(eltype(ctr[1].f), nvelocity, 2nx + 1)
-    @threads :static for i in 1:nx
-        @views state[:, i] .= vec(ctr[i].f)
-    end
+    size(state) == (nvelocity, 2nx + 1) || throw(
+        DimensionMismatch("invalid packed normal-shock state size"),
+    )
     @threads :static for i in 1:(nx+1)
+        if i <= nx
+            @views state[:, i] .= vec(ctr[i].f)
+        end
         @views state[:, nx+i] .= vec(face[i].f)
     end
     return state
+end
+
+function pack_normal_shock_state(ks, ctr, face)
+    state = zeros(
+        eltype(ctr[1].f), length(ks.vs.u), 2 * ks.ps.nx + 1,
+    )
+    return pack_normal_shock_state!(state, ks, ctr, face)
 end
 
 """Packed-state column occupied by physical interface i."""
@@ -557,7 +588,8 @@ function normal_shock_transport_rhs!(derivative, state, parameters, time)
     dt = parameters.step_size
     size(state) == (nvelocity, 2nx + 1) ||
         throw(DimensionMismatch("invalid packed normal-shock state"))
-    fill!(derivative, zero(eltype(derivative)))
+    # The final pass writes every entry of `derivative`; avoid a full extra
+    # phase-space traversal before starting the actual transport work.
 
     low_face = parameters.low_face
     limited_face = parameters.limited_face
@@ -600,23 +632,21 @@ function normal_shock_transport_rhs!(derivative, state, parameters, time)
             end
         end
         if correction_scale < 1
-            for i in 1:nx+1
+            for i in 1:(nx+1)
                 limited_face[j, i] = low_face[j, i] + correction_scale *
                                      (limited_face[j, i] - low_face[j, i])
             end
         end
     end
 
-    @threads :static for i in 1:nx
-        for j in 1:nvelocity
-            derivative[j, i] = -parameters.velocity_x[j] / dx *
-                               (limited_face[j, i+1] - limited_face[j, i])
-        end
-    end
-
+    # Cell-average and point-value components share one final threaded pass.
     @threads :static for i in 1:(nx+1)
         for j in 1:nvelocity
             velocity = parameters.velocity_x[j]
+            if i <= nx
+                derivative[j, i] = -velocity / dx *
+                                   (limited_face[j, i+1] - limited_face[j, i])
+            end
             point_column = normal_shock_interface_column(parameters, i)
             incoming = (i == 1 && velocity >= 0) ||
                        (i == nx + 1 && velocity < 0)
@@ -668,10 +698,10 @@ function unpack_normal_shock_state!(
 )
     nx = ks.ps.nx
     shape = size(ks.vs.u)
-    @threads :static for i in 1:nx
-        ctr[i].f .= reshape(@view(state[:, i]), shape)
-    end
     @threads :static for i in 1:(nx+1)
+        if i <= nx
+            ctr[i].f .= reshape(@view(state[:, i]), shape)
+        end
         face[i].f .= reshape(@view(state[:, nx+i]), shape)
         face[i].favg .= face[i].f
     end
@@ -679,7 +709,7 @@ function unpack_normal_shock_state!(
     for i in 1:nx
         update_shock_macroscopic!(ctr[i], ks, workspace)
     end
-    for i in 1:nx+1
+    for i in 1:(nx+1)
         update_shock_macroscopic!(face[i], ks, workspace)
     end
     apply_normal_shock_boundary!(
@@ -688,7 +718,87 @@ function unpack_normal_shock_state!(
     return nothing
 end
 
-"""Advance one collisionless active-flux interval with explicit Euler."""
+"""Allocate normal-shock transport work arrays and ODE integrator once."""
+function create_normal_shock_transport_cache(
+    ks,
+    ctr,
+    face,
+    left_distribution,
+    right_distribution,
+    workspace,
+    dt;
+    algorithm=Euler(),
+)
+    packed_state = pack_normal_shock_state(ks, ctr, face)
+    nvelocity = length(ks.vs.u)
+    parameters = NormalShockTransportParameters(
+        ks,
+        collect(vec(ks.vs.u)),
+        collect(vec(left_distribution)),
+        collect(vec(right_distribution)),
+        zeros(eltype(packed_state), nvelocity, ks.ps.nx + 1),
+        zeros(eltype(packed_state), nvelocity, ks.ps.nx + 1),
+        dt,
+    )
+    problem = ODEProblem(
+        normal_shock_transport_rhs!,
+        packed_state,
+        (zero(dt), dt),
+        parameters,
+    )
+    integrator = init(
+        problem,
+        algorithm;
+        adaptive=false,
+        dt,
+        save_everystep=false,
+        save_start=false,
+        save_end=false,
+        dense=false,
+    )
+    return NormalShockTransportCache(packed_state, parameters, integrator)
+end
+
+"""Advance one collisionless interval with the persistent ODE integrator."""
+function normal_shock_transport_rk_step!(
+    ks,
+    ctr,
+    face,
+    dt,
+    left_distribution,
+    right_distribution,
+    workspace,
+    cache::NormalShockTransportCache,
+)
+    pack_normal_shock_state!(cache.packed_state, ks, ctr, face)
+    cache.parameters.step_size = dt
+    reinit!(
+        cache.integrator,
+        cache.packed_state;
+        t0=zero(dt),
+        tf=dt,
+        erase_sol=true,
+        reset_dt=false,
+        reinit_dae=false,
+        reinit_callbacks=false,
+        initialize_save=false,
+        reinit_cache=true,
+    )
+    set_proposed_dt!(cache.integrator, dt)
+    solve!(cache.integrator)
+    unpack_normal_shock_state!(
+        cache.integrator.u,
+        ks,
+        ctr,
+        face,
+        left_distribution,
+        right_distribution,
+        workspace,
+    )
+    return cache.integrator
+end
+
+"""Allocate a temporary cache for a standalone one-interval transport call."""
 function normal_shock_transport_rk_step!(
     ks,
     ctr,
@@ -699,40 +809,26 @@ function normal_shock_transport_rk_step!(
     workspace;
     algorithm=Euler(),
 )
-    initial_state = pack_normal_shock_state(ks, ctr, face)
-    nvelocity = length(ks.vs.u)
-    parameters = NormalShockTransportParameters(
-        ks,
-        collect(vec(ks.vs.u)),
-        collect(vec(left_distribution)),
-        collect(vec(right_distribution)),
-        zeros(eltype(initial_state), nvelocity, ks.ps.nx + 1),
-        zeros(eltype(initial_state), nvelocity, ks.ps.nx + 1),
-        dt,
-    )
-    problem = ODEProblem(
-        normal_shock_transport_rhs!,
-        initial_state,
-        (zero(dt), dt),
-        parameters,
-    )
-    solution = solve(
-        problem,
-        algorithm;
-        adaptive=false,
-        dt,
-        save_everystep=false,
-    )
-    unpack_normal_shock_state!(
-        last(solution.u),
+    cache = create_normal_shock_transport_cache(
         ks,
         ctr,
         face,
         left_distribution,
         right_distribution,
         workspace,
+        dt;
+        algorithm,
     )
-    return solution
+    return normal_shock_transport_rk_step!(
+        ks,
+        ctr,
+        face,
+        dt,
+        left_distribution,
+        right_distribution,
+        workspace,
+        cache,
+    )
 end
 
 """Remove the five discrete moments of a fast-spectral collision array."""
@@ -992,9 +1088,10 @@ function normal_shock_collision_step!(
     # Collision is nonlinear in f. Therefore Q must be evaluated on the
     # reconstructed point distributions before Gauss averaging back to fbar.
     @threads :static for i in 1:ks.ps.nx
-        tid = threadid()
+        slot = pool.thread_slots[threadid()]
+        slot > 0 || error("missing normal-shock collision cache")
         residual = normal_shock_collision_cell!(
-            pool.caches[tid],
+            pool.caches[slot],
             ks,
             ctr,
             face,
@@ -1003,15 +1100,16 @@ function normal_shock_collision_step!(
             collision_model,
             collision_substeps,
         )
-        pool.residuals[tid] = max(pool.residuals[tid], residual)
+        pool.residuals[1, slot] = max(pool.residuals[1, slot], residual)
     end
     maximum_collision_residual = maximum(pool.residuals)
 
     fill!(pool.residuals, 0)
     @threads :static for i in 1:(ks.ps.nx+1)
-        tid = threadid()
+        slot = pool.thread_slots[threadid()]
+        slot > 0 || error("missing normal-shock collision cache")
         residual = normal_shock_collision_interface!(
-            pool.caches[tid],
+            pool.caches[slot],
             ks,
             face,
             i,
@@ -1019,7 +1117,7 @@ function normal_shock_collision_step!(
             collision_model,
             collision_substeps,
         )
-        pool.residuals[tid] = max(pool.residuals[tid], residual)
+        pool.residuals[1, slot] = max(pool.residuals[1, slot], residual)
     end
     maximum_collision_residual = max(
         maximum_collision_residual,
@@ -1059,6 +1157,16 @@ function solve_normal_shock_active_flux(;
         create_shock_collision_thread_pool(ks, workspace)
     ctr, face, left_distribution, right_distribution =
         initialize_normal_shock_solution(ks, workspace; initial_width)
+    transport_cache = create_normal_shock_transport_cache(
+        ks,
+        ctr,
+        face,
+        left_distribution,
+        right_distribution,
+        workspace,
+        normal_shock_timestep(ks, 0.0);
+        algorithm,
+    )
 
     time = 0.0
     steps = 0
@@ -1087,8 +1195,8 @@ function solve_normal_shock_active_flux(;
             dt,
             left_distribution,
             right_distribution,
-            workspace;
-            algorithm,
+            workspace,
+            transport_cache,
         )
         maximum_collision_residual = max(
             maximum_collision_residual,
@@ -1180,7 +1288,7 @@ function normal_shock_result_data(result)
         @views conservative[:, i] .= ctr[i].w
         @views primitive[:, i] .= ctr[i].prim
     end
-    for i in 1:nx+1
+    for i in 1:(nx+1)
         @views interface_distribution[:, :, :, i] .= face[i].f
     end
 
@@ -1246,6 +1354,7 @@ function print_normal_shock_diagnostics(result)
     println("  collision model: ", uppercase(String(result.collision_model)))
     println("  transport integrator: ", nameof(typeof(result.algorithm)))
     println("  Julia transport/collision threads: ", result.collision_threads)
+    println("  BLAS threads: ", BLAS.get_num_threads())
     println("  final time: ", result.time)
     println("  Strang steps: ", result.steps)
     println("  elapsed seconds: ", round(result.elapsed; digits=3))

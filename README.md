@@ -79,10 +79,14 @@ be submitted as separate remote jobs. From the repository root, run:
 
 ```shell
 mkdir -p remote_results
-julia --threads=4 --project=. src/sod_kn1e-4.jl remote_results
-julia --threads=4 --project=. src/sod_kn1e-2.jl remote_results
-julia --threads=4 --project=. src/sod_kn1.jl remote_results
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4 --project=. src/sod_kn1e-4.jl remote_results
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4 --project=. src/sod_kn1e-2.jl remote_results
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4 --project=. src/sod_kn1.jl remote_results
 ```
+
+The Julia workers own the phase-space parallelism, so BLAS and OpenMP are kept
+single-threaded to avoid nested thread teams. Each driver prints both the Julia
+and BLAS thread counts before starting the expensive calculation.
 
 Each command may be executed in a different scheduler job. Do not start all
 three simultaneously on one node unless it has at least 12 allocated CPU
@@ -145,12 +149,16 @@ an unlimited undershoot.
 
 The reconstructed cell/interface collisions and the transport flux/RHS loops
 use `Threads.@threads`. Each collision worker owns independent reconstruction
-arrays, FSM temporaries, and conservative-projection storage; each transport
-worker has a private positivity-limiter buffer. The spectral kernel and shock
-sensor are read-only and shared. Launching Julia with `--threads=4` selects the
-tested four-thread execution; a different positive thread count may be used
-when it matches the remote scheduler allocation. To plot only the
-small-Knudsen result against Euler after its job finishes, use:
+arrays, FSM temporaries, and conservative-projection storage. Transport
+workers write disjoint physical-cell/interface columns of shared scratch
+arrays. The packed transport state, limiter arrays, and initialized
+OrdinaryDiffEq integrator are reused across all Strang steps. The spectral
+kernel and shock sensor are read-only and shared. Launching Julia with
+`--threads=4` selects the configuration used in the examples, but four is not
+hard-coded: launching with `--threads=N` creates exactly `N` collision
+workspaces for the active default-pool workers. Choose `N` to match the remote
+scheduler allocation. To plot only the small-Knudsen result against Euler
+after its job finishes, use:
 
 ```shell
 julia --project=. -e 'include("src/sod_plot.jl"); plot_sod_continuum_check(data_path="remote_results/sod_kn1e-4.jld2")'
@@ -164,7 +172,7 @@ The affordable limiter comparison uses the same `nx=50` physical mesh but a
 coarse velocity grid solely to isolate the transport treatment:
 
 ```shell
-julia --threads=4 --project=. -e 'include("src/sod_simulation.jl"); run_sod_limiter_comparison()'
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4 --project=. -e 'include("src/sod_simulation.jl"); run_sod_limiter_comparison()'
 ```
 
 Its three JLD2 files are written under `data/limiter_comparison/`. These data
@@ -188,8 +196,8 @@ Case 3 is split into two independent simulations and a lightweight plotting
 step so that the expensive full-Boltzmann result can be reused:
 
 ```shell
-julia --threads=4 --project=. src/shock_boltzmann.jl
-julia --threads=4 --project=. src/shock_bgk.jl
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4 --project=. src/shock_boltzmann.jl
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 julia --threads=4 --project=. src/shock_bgk.jl
 julia --project=. src/shock_plot.jl
 ```
 
@@ -201,10 +209,13 @@ kinetic simulation. Optional command-line arguments select the simulation
 output path, or (for the plotting program) the two input paths and figure path.
 The shared solver in `src/shock.jl` uses `1d1f3v`, `K=0`, and `gamma=5/3`.
 Its full-Boltzmann backend likewise fixes the FSM angular-mode count at five.
-Both collision backends and the transport RHS use thread-private workspaces
-when Julia is launched with multiple threads. Its remaining defaults are meant
-for a quick implementation check; longer final times and refined physical and
-velocity grids are needed for a steady resolved study.
+Both collision backends use compact thread-private workspace pools, while the
+transport RHS partitions shared arrays into disjoint physical columns. Its
+workspace count is determined at run time by `Threads.nthreads()`, not by the
+four-thread launch examples above. The remaining defaults are meant for a
+quick implementation check; longer final
+times and refined physical and velocity grids are needed for a steady resolved
+study.
 
 The two convergence programs deliberately retain the exact characteristic
 active-flux update and Strang splitting because they isolate spatial accuracy:
@@ -216,6 +227,17 @@ julia --project=. src/convergence2-overresolve.jl
 
 They are not used as the time-integration drivers for the advection or Sod
 figures.
+
+The dissipation and dispersion figure in the manuscript is generated directly
+from the two-branch Fourier symbol of the same semi-discrete transport RHS:
+
+```shell
+julia --project=. src/dispersion.jl
+```
+
+This writes `tex/figures/transport-spectrum.pdf` and reports the SSPRK33
+transport stability limit obtained by maximizing the amplification radius over
+both the physical and internal active-flux modes.
 
 ## License
 
