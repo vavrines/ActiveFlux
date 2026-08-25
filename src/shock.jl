@@ -26,6 +26,7 @@ using KitBase
 using KitBase.OffsetArrays
 using LinearAlgebra
 using OrdinaryDiffEq: Euler, ODEProblem, solve
+using Base.Threads: @threads, maxthreadid, nthreads, threadid
 
 # Four Gauss--Legendre points are enough to integrate the quadratic active-flux
 # reconstruction exactly.  They are also used to construct genuine initial
@@ -87,6 +88,20 @@ mutable struct ShockCollisionWorkspace{T,TA,TM,TV}
     defect::Vector{T}
     coefficients::Vector{T}
     gram::Matrix{T}
+end
+
+"""Thread-private storage used by one reconstructed collision update."""
+mutable struct ShockCollisionThreadCache{TW,TP,TA}
+    workspace::TW
+    point_values::TP
+    point_distribution::TA
+    updated_average::TA
+end
+
+"""Collision caches for all Julia threads and a reduction buffer."""
+struct ShockCollisionThreadPool{TC,TR}
+    caches::TC
+    residuals::TR
 end
 
 """Parameters and scratch arrays of the semi-discrete transport operator."""
@@ -243,6 +258,30 @@ function create_shock_collision_workspace(ks)
         zeros(T, 5),
         zeros(T, 5),
         zeros(T, 5, 5),
+    )
+end
+
+"""Allocate independent FSM/BGK temporaries for every Julia worker."""
+function create_shock_collision_thread_pool(ks, primary_workspace)
+    make_cache(workspace) = ShockCollisionThreadCache(
+        workspace,
+        zeros(
+            eltype(ks.vs.u),
+            length(SHOCK_GL4_NODES),
+            length(ks.vs.u),
+        ),
+        similar(ks.vs.u),
+        similar(ks.vs.u),
+    )
+    first_cache = make_cache(primary_workspace)
+    caches = Vector{typeof(first_cache)}(undef, maxthreadid())
+    caches[1] = first_cache
+    for tid in 2:length(caches)
+        caches[tid] = make_cache(create_shock_collision_workspace(ks))
+    end
+    return ShockCollisionThreadPool(
+        caches,
+        zeros(eltype(ks.vs.u), length(caches)),
     )
 end
 
@@ -473,10 +512,10 @@ function pack_normal_shock_state(ks, ctr, face)
     nvelocity = length(ks.vs.u)
     nx = ks.ps.nx
     state = zeros(eltype(ctr[1].f), nvelocity, 2nx + 1)
-    for i in 1:nx
+    @threads :static for i in 1:nx
         @views state[:, i] .= vec(ctr[i].f)
     end
-    for i in 1:nx+1
+    @threads :static for i in 1:(nx+1)
         @views state[:, nx+i] .= vec(face[i].f)
     end
     return state
@@ -523,23 +562,25 @@ function normal_shock_transport_rhs!(derivative, state, parameters, time)
     low_face = parameters.low_face
     limited_face = parameters.limited_face
 
-    for i in 1:nx+1, j in 1:nvelocity
-        velocity = parameters.velocity_x[j]
-        left = normal_shock_adjacent_value(state, parameters, i, j, :left)
-        right = normal_shock_adjacent_value(state, parameters, i, j, :right)
-        upwind = velocity >= 0 ? left : right
-        point = state[j, normal_shock_interface_column(parameters, i)]
-        blend = normal_shock_jump_blend(left, right)
-        incoming = (i == 1 && velocity >= 0) ||
-                   (i == nx + 1 && velocity < 0)
-        low_face[j, i] = upwind
-        limited_face[j, i] = incoming ? upwind :
-                              upwind + blend * (point - upwind)
+    @threads :static for i in 1:(nx+1)
+        for j in 1:nvelocity
+            velocity = parameters.velocity_x[j]
+            left = normal_shock_adjacent_value(state, parameters, i, j, :left)
+            right = normal_shock_adjacent_value(state, parameters, i, j, :right)
+            upwind = velocity >= 0 ? left : right
+            point = state[j, normal_shock_interface_column(parameters, i)]
+            blend = normal_shock_jump_blend(left, right)
+            incoming = (i == 1 && velocity >= 0) ||
+                       (i == nx + 1 && velocity < 0)
+            low_face[j, i] = upwind
+            limited_face[j, i] = incoming ? upwind :
+                                  upwind + blend * (point - upwind)
+        end
     end
 
     # One scale per velocity component retains the conservative difference of
     # two neighboring face fluxes while preventing a negative cell average.
-    for j in 1:nvelocity
+    @threads :static for j in 1:nvelocity
         velocity = parameters.velocity_x[j]
         correction_scale = 1.0
         for i in 1:nx
@@ -566,47 +607,51 @@ function normal_shock_transport_rhs!(derivative, state, parameters, time)
         end
     end
 
-    for i in 1:nx, j in 1:nvelocity
-        derivative[j, i] = -parameters.velocity_x[j] / dx *
-                           (limited_face[j, i+1] - limited_face[j, i])
+    @threads :static for i in 1:nx
+        for j in 1:nvelocity
+            derivative[j, i] = -parameters.velocity_x[j] / dx *
+                               (limited_face[j, i+1] - limited_face[j, i])
+        end
     end
 
-    for i in 1:nx+1, j in 1:nvelocity
-        velocity = parameters.velocity_x[j]
-        point_column = normal_shock_interface_column(parameters, i)
-        incoming = (i == 1 && velocity >= 0) ||
-                   (i == nx + 1 && velocity < 0)
-        if incoming
-            derivative[j, point_column] = 0
-            continue
-        end
+    @threads :static for i in 1:(nx+1)
+        for j in 1:nvelocity
+            velocity = parameters.velocity_x[j]
+            point_column = normal_shock_interface_column(parameters, i)
+            incoming = (i == 1 && velocity >= 0) ||
+                       (i == nx + 1 && velocity < 0)
+            if incoming
+                derivative[j, point_column] = 0
+                continue
+            end
 
-        left = normal_shock_adjacent_value(state, parameters, i, j, :left)
-        right = normal_shock_adjacent_value(state, parameters, i, j, :right)
-        upwind = velocity >= 0 ? left : right
-        blend = normal_shock_jump_blend(left, right)
-        high_derivative = if velocity >= 0
-            far_left = state[
-                j, normal_shock_interface_column(parameters, i-1),
-            ]
-            -velocity / dx *
-            (2far_left - 6state[j, i-1] + 4state[j, point_column])
-        else
-            far_right = state[
-                j, normal_shock_interface_column(parameters, i+1),
-            ]
-            -velocity / dx *
-            (-4state[j, point_column] + 6state[j, i] - 2far_right)
+            left = normal_shock_adjacent_value(state, parameters, i, j, :left)
+            right = normal_shock_adjacent_value(state, parameters, i, j, :right)
+            upwind = velocity >= 0 ? left : right
+            blend = normal_shock_jump_blend(left, right)
+            high_derivative = if velocity >= 0
+                far_left = state[
+                    j, normal_shock_interface_column(parameters, i-1),
+                ]
+                -velocity / dx *
+                (2far_left - 6state[j, i-1] + 4state[j, point_column])
+            else
+                far_right = state[
+                    j, normal_shock_interface_column(parameters, i+1),
+                ]
+                -velocity / dx *
+                (-4state[j, point_column] + 6state[j, i] - 2far_right)
+            end
+            low_derivative = -abs(velocity) / dx *
+                             (state[j, point_column] - upwind)
+            point_derivative = low_derivative + blend *
+                               (high_derivative - low_derivative)
+            if state[j, point_column] + dt * point_derivative < 0
+                point_derivative = -0.999999999999 *
+                                   state[j, point_column] / dt
+            end
+            derivative[j, point_column] = point_derivative
         end
-        low_derivative = -abs(velocity) / dx *
-                         (state[j, point_column] - upwind)
-        point_derivative = low_derivative + blend *
-                           (high_derivative - low_derivative)
-        if state[j, point_column] + dt * point_derivative < 0
-            point_derivative = -0.999999999999 *
-                               state[j, point_column] / dt
-        end
-        derivative[j, point_column] = point_derivative
     end
     return nothing
 end
@@ -623,13 +668,18 @@ function unpack_normal_shock_state!(
 )
     nx = ks.ps.nx
     shape = size(ks.vs.u)
-    for i in 1:nx
+    @threads :static for i in 1:nx
         ctr[i].f .= reshape(@view(state[:, i]), shape)
+    end
+    @threads :static for i in 1:(nx+1)
+        face[i].f .= reshape(@view(state[:, nx+i]), shape)
+        face[i].favg .= face[i].f
+    end
+
+    for i in 1:nx
         update_shock_macroscopic!(ctr[i], ks, workspace)
     end
     for i in 1:nx+1
-        face[i].f .= reshape(@view(state[:, nx+i]), shape)
-        face[i].favg .= face[i].f
         update_shock_macroscopic!(face[i], ks, workspace)
     end
     apply_normal_shock_boundary!(
@@ -858,7 +908,71 @@ function limited_shock_collision_points!(point_values, ks, ctr, face, i)
     return nothing
 end
 
-"""Apply one x-high-order collision half step to cells and interfaces."""
+"""Collide one reconstructed physical cell with thread-private temporaries."""
+function normal_shock_collision_cell!(
+    cache,
+    ks,
+    ctr,
+    face,
+    i,
+    dt,
+    collision_model,
+    collision_substeps,
+)
+    point_values = cache.point_values
+    point_distribution = cache.point_distribution
+    updated_average = cache.updated_average
+    workspace = cache.workspace
+    maximum_residual = 0.0
+
+    limited_shock_collision_points!(point_values, ks, ctr, face, i)
+    fill!(updated_average, 0)
+    for q in eachindex(SHOCK_GL4_NODES)
+        point_distribution .= reshape(
+            @view(point_values[q, :]), size(ks.vs.u),
+        )
+        residual = local_shock_collision_update!(
+            point_distribution,
+            ks,
+            dt,
+            workspace,
+            collision_model;
+            collision_substeps,
+        )
+        maximum_residual = max(maximum_residual, residual)
+        @. updated_average +=
+            0.5 * SHOCK_GL4_WEIGHTS[q] * point_distribution
+    end
+    ctr[i].f .= updated_average
+    update_shock_macroscopic!(ctr[i], ks, workspace)
+    return maximum_residual
+end
+
+"""Collide one active-flux interface with thread-private temporaries."""
+function normal_shock_collision_interface!(
+    cache,
+    ks,
+    face,
+    i,
+    dt,
+    collision_model,
+    collision_substeps,
+)
+    workspace = cache.workspace
+    residual = local_shock_collision_update!(
+        face[i].f,
+        ks,
+        dt,
+        workspace,
+        collision_model;
+        collision_substeps,
+    )
+    face[i].favg .= face[i].f
+    update_shock_macroscopic!(face[i], ks, workspace)
+    return residual
+end
+
+"""Apply one parallel x-high-order collision half step."""
 function normal_shock_collision_step!(
     ks,
     ctr,
@@ -869,53 +983,48 @@ function normal_shock_collision_step!(
     workspace,
     collision_model;
     collision_substeps=1,
+    thread_pool=nothing,
 )
-    nvelocity = length(ks.vs.u)
-    point_values = zeros(eltype(ks.vs.u), 4, nvelocity)
-    point_distribution = similar(ks.vs.u)
-    updated_average = similar(ks.vs.u)
-    maximum_collision_residual = 0.0
+    pool = isnothing(thread_pool) ?
+           create_shock_collision_thread_pool(ks, workspace) : thread_pool
+    fill!(pool.residuals, 0)
 
-    # Collision is nonlinear in f.  Therefore Q must be evaluated on the
+    # Collision is nonlinear in f. Therefore Q must be evaluated on the
     # reconstructed point distributions before Gauss averaging back to fbar.
-    for i in 1:ks.ps.nx
-        limited_shock_collision_points!(point_values, ks, ctr, face, i)
-        fill!(updated_average, 0)
-        for q in eachindex(SHOCK_GL4_NODES)
-            point_distribution .= reshape(
-                @view(point_values[q, :]), size(ks.vs.u),
-            )
-            residual = local_shock_collision_update!(
-                point_distribution,
-                ks,
-                dt,
-                workspace,
-                collision_model;
-                collision_substeps,
-            )
-            maximum_collision_residual = max(
-                maximum_collision_residual, residual,
-            )
-            @. updated_average +=
-                0.5 * SHOCK_GL4_WEIGHTS[q] * point_distribution
-        end
-        ctr[i].f .= updated_average
-        update_shock_macroscopic!(ctr[i], ks, workspace)
-    end
-
-    for i in 1:ks.ps.nx+1
-        residual = local_shock_collision_update!(
-            face[i].f,
+    @threads :static for i in 1:ks.ps.nx
+        tid = threadid()
+        residual = normal_shock_collision_cell!(
+            pool.caches[tid],
             ks,
+            ctr,
+            face,
+            i,
             dt,
-            workspace,
-            collision_model;
+            collision_model,
             collision_substeps,
         )
-        maximum_collision_residual = max(maximum_collision_residual, residual)
-        face[i].favg .= face[i].f
-        update_shock_macroscopic!(face[i], ks, workspace)
+        pool.residuals[tid] = max(pool.residuals[tid], residual)
     end
+    maximum_collision_residual = maximum(pool.residuals)
+
+    fill!(pool.residuals, 0)
+    @threads :static for i in 1:(ks.ps.nx+1)
+        tid = threadid()
+        residual = normal_shock_collision_interface!(
+            pool.caches[tid],
+            ks,
+            face,
+            i,
+            dt,
+            collision_model,
+            collision_substeps,
+        )
+        pool.residuals[tid] = max(pool.residuals[tid], residual)
+    end
+    maximum_collision_residual = max(
+        maximum_collision_residual,
+        maximum(pool.residuals),
+    )
 
     apply_normal_shock_boundary!(
         ks, ctr, face, left_distribution, right_distribution, workspace,
@@ -946,6 +1055,8 @@ function solve_normal_shock_active_flux(;
 )
     ks = create_normal_shock_solver(; collision_model, kwargs...)
     workspace = create_shock_collision_workspace(ks)
+    collision_thread_pool =
+        create_shock_collision_thread_pool(ks, workspace)
     ctr, face, left_distribution, right_distribution =
         initialize_normal_shock_solution(ks, workspace; initial_width)
 
@@ -966,6 +1077,7 @@ function solve_normal_shock_active_flux(;
                 workspace,
                 collision_model;
                 collision_substeps,
+                thread_pool=collision_thread_pool,
             ),
         )
         normal_shock_transport_rk_step!(
@@ -990,6 +1102,7 @@ function solve_normal_shock_active_flux(;
                 workspace,
                 collision_model;
                 collision_substeps,
+                thread_pool=collision_thread_pool,
             ),
         )
         time += dt
@@ -1008,6 +1121,7 @@ function solve_normal_shock_active_flux(;
         elapsed,
         collision_model,
         collision_substeps,
+        collision_threads=nthreads(),
         maximum_collision_residual,
         minimum_distribution,
         algorithm,
@@ -1077,6 +1191,7 @@ function normal_shock_result_data(result)
         "time" => result.time,
         "steps" => result.steps,
         "elapsed_seconds" => result.elapsed,
+        "collision_threads" => result.collision_threads,
         "minimum_distribution" => result.minimum_distribution,
         "maximum_collision_residual" => result.maximum_collision_residual,
         "algorithm" => String(nameof(typeof(result.algorithm))),
@@ -1130,6 +1245,7 @@ function print_normal_shock_diagnostics(result)
     println("Active-flux normal-shock simulation completed")
     println("  collision model: ", uppercase(String(result.collision_model)))
     println("  transport integrator: ", nameof(typeof(result.algorithm)))
+    println("  Julia transport/collision threads: ", result.collision_threads)
     println("  final time: ", result.time)
     println("  Strang steps: ", result.steps)
     println("  elapsed seconds: ", round(result.elapsed; digits=3))

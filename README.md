@@ -143,13 +143,14 @@ stores Euler-profile errors and the minimum cell/interface distribution
 immediately after transport, before the positive collision projection can hide
 an unlimited undershoot.
 
-The reconstructed cell collisions and active-flux interface collisions use
-`Threads.@threads`. Each worker owns independent reconstruction arrays, FSM
-temporaries, and conservative-projection storage; the spectral kernel is
-read-only and shared. Launching Julia with `--threads=4` selects the tested
-four-thread execution; a different positive thread count may be used when it
-matches the remote scheduler allocation. To plot only the small-Knudsen result
-against Euler after its job finishes, use:
+The reconstructed cell/interface collisions and the transport flux/RHS loops
+use `Threads.@threads`. Each collision worker owns independent reconstruction
+arrays, FSM temporaries, and conservative-projection storage; each transport
+worker has a private positivity-limiter buffer. The spectral kernel and shock
+sensor are read-only and shared. Launching Julia with `--threads=4` selects the
+tested four-thread execution; a different positive thread count may be used
+when it matches the remote scheduler allocation. To plot only the
+small-Knudsen result against Euler after its job finishes, use:
 
 ```shell
 julia --project=. -e 'include("src/sod_plot.jl"); plot_sod_continuum_check(data_path="remote_results/sod_kn1e-4.jld2")'
@@ -187,8 +188,8 @@ Case 3 is split into two independent simulations and a lightweight plotting
 step so that the expensive full-Boltzmann result can be reused:
 
 ```shell
-julia --project=. src/shock_boltzmann.jl
-julia --project=. src/shock_bgk.jl
+julia --threads=4 --project=. src/shock_boltzmann.jl
+julia --threads=4 --project=. src/shock_bgk.jl
 julia --project=. src/shock_plot.jl
 ```
 
@@ -200,9 +201,10 @@ kinetic simulation. Optional command-line arguments select the simulation
 output path, or (for the plotting program) the two input paths and figure path.
 The shared solver in `src/shock.jl` uses `1d1f3v`, `K=0`, and `gamma=5/3`.
 Its full-Boltzmann backend likewise fixes the FSM angular-mode count at five.
-Its remaining defaults are meant for a quick implementation check; longer
-final times and refined physical and velocity grids are needed for a steady
-resolved study.
+Both collision backends and the transport RHS use thread-private workspaces
+when Julia is launched with multiple threads. Its remaining defaults are meant
+for a quick implementation check; longer final times and refined physical and
+velocity grids are needed for a steady resolved study.
 
 The two convergence programs deliberately retain the exact characteristic
 active-flux update and Strang splitting because they isolate spatial accuracy:

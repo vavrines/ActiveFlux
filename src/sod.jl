@@ -740,7 +740,7 @@ function sod_macroscopic_jump_blend(
 end
 
 """Parameters of the case-specific semi-discrete Sod transport operator."""
-struct SodTransportParameters{KS,TV,TL,TR,TM,TMM,TS,T}
+struct SodTransportParameters{KS,TV,TL,TR,TM,TMM,TS,TPR,T}
     ks::KS
     velocity_x::TV
     left_distribution::TL
@@ -752,7 +752,7 @@ struct SodTransportParameters{KS,TV,TL,TR,TM,TMM,TS,T}
     density::TS
     pressure::TS
     face_blend::TS
-    positivity_ratio::TS
+    positivity_ratio::TPR
     limiter::Symbol
     sensor_smooth::T
     sensor_nonsmooth::T
@@ -788,10 +788,10 @@ different degrees of freedom, so the packed state has 2nx+1 columns.
 function pack_sod_state(ks, ctr, face)
     nvelocity = length(ks.vs.u)
     state = zeros(eltype(ctr[1].f), nvelocity, 2 * ks.ps.nx + 1)
-    for i in 1:ks.ps.nx
+    @threads :static for i in 1:ks.ps.nx
         @views state[:, i] .= vec(ctr[i].f)
     end
-    for i in 1:ks.ps.nx+1
+    @threads :static for i in 1:(ks.ps.nx+1)
         @views state[:, ks.ps.nx+i] .= vec(face[i].f)
     end
     return state
@@ -812,13 +812,21 @@ function unpack_sod_state!(
     size(state) == (length(ks.vs.u), 2 * nx + 1) ||
         throw(DimensionMismatch("invalid packed Sod state size $(size(state))"))
 
-    for i in 1:nx
+    @threads :static for i in 1:nx
         ctr[i].f .= reshape(@view(state[:, i]), shape)
+    end
+    @threads :static for i in 1:(nx+1)
+        face[i].f .= reshape(@view(state[:, nx+i]), shape)
+        face[i].favg .= face[i].f
+    end
+
+    # Moment evaluation uses the primary mutable workspace and is therefore
+    # kept outside the parallel copy loops. Its cost is small relative to the
+    # phase-space copies and transport RHS.
+    for i in 1:nx
         update_sod_macroscopic!(ctr[i], ks, workspace)
     end
     for i in 1:nx+1
-        face[i].f .= reshape(@view(state[:, nx+i]), shape)
-        face[i].favg .= face[i].f
         update_sod_macroscopic!(face[i], ks, workspace)
     end
     apply_sod_boundary!(
@@ -923,30 +931,34 @@ function sod_transport_rhs!(derivative, state, parameters, time)
         fill!(parameters.face_blend, one(eltype(parameters.face_blend)))
     end
 
-    # Build first-order and active-flux kinetic face states for each velocity.
-    for i in 1:nx+1, j in 1:nvelocity
-        velocity = parameters.velocity_x[j]
-        left_value = sod_adjacent_value(state, parameters, i, j, :left)
-        right_value = sod_adjacent_value(state, parameters, i, j, :right)
-        upwind_value = velocity >= 0 ? left_value : right_value
-        point_value = state[j, sod_interface_column(parameters, i)]
-        blend = limiter === :legacy ?
-                sod_jump_blend(left_value, right_value) :
-                parameters.face_blend[i]
+    # Each physical interface owns a contiguous velocity-space column in the
+    # packed arrays, so threading over interfaces gives disjoint writes and
+    # cache-friendly inner loops over molecular velocity.
+    @threads :static for i in 1:(nx+1)
+        for j in 1:nvelocity
+            velocity = parameters.velocity_x[j]
+            left_value = sod_adjacent_value(state, parameters, i, j, :left)
+            right_value = sod_adjacent_value(state, parameters, i, j, :right)
+            upwind_value = velocity >= 0 ? left_value : right_value
+            point_value = state[j, sod_interface_column(parameters, i)]
+            blend = limiter === :legacy ?
+                    sod_jump_blend(left_value, right_value) :
+                    parameters.face_blend[i]
 
-        # Incoming boundary data are exact reservoirs and carry no
-        # antidiffusive correction.
-        incoming = (i == 1 && velocity >= 0) ||
-                   (i == nx + 1 && velocity < 0)
-        low_face[j, i] = upwind_value
-        limited_face[j, i] = incoming ? upwind_value :
-                             upwind_value + blend * (point_value - upwind_value)
+            # Incoming boundary data are exact reservoirs and carry no
+            # antidiffusive correction.
+            incoming = (i == 1 && velocity >= 0) ||
+                       (i == nx + 1 && velocity < 0)
+            low_face[j, i] = upwind_value
+            limited_face[j, i] = incoming ? upwind_value :
+                upwind_value + blend * (point_value - upwind_value)
+        end
     end
 
     if limiter === :legacy
         # Original comparison method: one troubled cell reduces the active-
         # flux correction at every physical face for that molecular velocity.
-        for j in 1:nvelocity
+        @threads :static for j in 1:nvelocity
             velocity = parameters.velocity_x[j]
             correction_scale = 1.0
             for i in 1:nx
@@ -979,9 +991,12 @@ function sod_transport_rhs!(derivative, state, parameters, time)
         # bound of the cell from which that correction removes population.
         # Unlike the legacy scalar, this coefficient never propagates a shock
         # restriction to unrelated faces elsewhere in the domain.
-        ratio = parameters.positivity_ratio
         safety = 0.999999999999
-        for j in 1:nvelocity
+        @threads :static for j in 1:nvelocity
+            # The positivity ratios are overwritten for every velocity. A
+            # thread-private row prevents races while avoiding an
+            # nvelocity-by-nx scratch array.
+            ratio = @view parameters.positivity_ratio[threadid(), :]
             velocity = parameters.velocity_x[j]
             scale = dt * velocity / dx
             for i in 1:nx
@@ -1015,50 +1030,55 @@ function sod_transport_rhs!(derivative, state, parameters, time)
     end
 
     # Conservative cell-average RHS using the limited kinetic face states.
-    for i in 1:nx, j in 1:nvelocity
-        derivative[j, i] = -parameters.velocity_x[j] / dx *
-                           (limited_face[j, i+1] - limited_face[j, i])
+    @threads :static for i in 1:nx
+        for j in 1:nvelocity
+            derivative[j, i] = -parameters.velocity_x[j] / dx *
+                               (limited_face[j, i+1] - limited_face[j, i])
+        end
     end
 
     # Semi-discrete evolution of the additional interface point values.
-    for i in 1:nx+1, j in 1:nvelocity
-        velocity = parameters.velocity_x[j]
-        point_column = sod_interface_column(parameters, i)
-        incoming = (i == 1 && velocity >= 0) ||
-                   (i == nx + 1 && velocity < 0)
-        if incoming
-            derivative[j, point_column] = 0
-            continue
-        end
+    @threads :static for i in 1:(nx+1)
+        for j in 1:nvelocity
+            velocity = parameters.velocity_x[j]
+            point_column = sod_interface_column(parameters, i)
+            incoming = (i == 1 && velocity >= 0) ||
+                       (i == nx + 1 && velocity < 0)
+            if incoming
+                derivative[j, point_column] = 0
+                continue
+            end
 
-        left_value = sod_adjacent_value(state, parameters, i, j, :left)
-        right_value = sod_adjacent_value(state, parameters, i, j, :right)
-        upwind_value = velocity >= 0 ? left_value : right_value
-        blend = limiter === :legacy ?
-                sod_jump_blend(left_value, right_value) :
-                parameters.face_blend[i]
-        high_derivative = if velocity >= 0
-            far_left = state[j, sod_interface_column(parameters, i-1)]
-            -velocity / dx *
-            (2 * far_left - 6 * state[j, i-1] + 4 * state[j, point_column])
-        else
-            far_right = state[j, sod_interface_column(parameters, i+1)]
-            -velocity / dx *
-            (-4 * state[j, point_column] + 6 * state[j, i] - 2 * far_right)
-        end
-        low_derivative = -abs(velocity) / dx *
-                         (state[j, point_column] - upwind_value)
-        point_derivative = low_derivative + blend *
-                           (high_derivative - low_derivative)
+            left_value = sod_adjacent_value(state, parameters, i, j, :left)
+            right_value = sod_adjacent_value(state, parameters, i, j, :right)
+            upwind_value = velocity >= 0 ? left_value : right_value
+            blend = limiter === :legacy ?
+                    sod_jump_blend(left_value, right_value) :
+                    parameters.face_blend[i]
+            high_derivative = if velocity >= 0
+                far_left = state[j, sod_interface_column(parameters, i-1)]
+                -velocity / dx *
+                (2 * far_left - 6 * state[j, i-1] + 4 * state[j, point_column])
+            else
+                far_right = state[j, sod_interface_column(parameters, i+1)]
+                -velocity / dx *
+                (-4 * state[j, point_column] + 6 * state[j, i] - 2 * far_right)
+            end
+            low_derivative = -abs(velocity) / dx *
+                             (state[j, point_column] - upwind_value)
+            point_derivative = low_derivative + blend *
+                               (high_derivative - low_derivative)
 
-        # Point values are nonconservative degrees of freedom. Scaling their
-        # derivative does not alter the finite-volume balance and prevents a
-        # negative interface state from entering the next collision half-step.
-        if limiter !== :none &&
-           state[j, point_column] + dt * point_derivative < 0
-            point_derivative = -0.999999999999 * state[j, point_column] / dt
+            # Point values are nonconservative degrees of freedom. Scaling
+            # their derivative does not alter the finite-volume balance and
+            # prevents a negative interface state from entering collision.
+            if limiter !== :none &&
+               state[j, point_column] + dt * point_derivative < 0
+                point_derivative =
+                    -0.999999999999 * state[j, point_column] / dt
+            end
+            derivative[j, point_column] = point_derivative
         end
-        derivative[j, point_column] = point_derivative
     end
     return nothing
 end
@@ -1097,7 +1117,7 @@ function sod_transport_rk_step!(
         zeros(eltype(initial_state), ks.ps.nx + 2),
         zeros(eltype(initial_state), ks.ps.nx + 2),
         ones(eltype(initial_state), ks.ps.nx + 1),
-        ones(eltype(initial_state), ks.ps.nx),
+        ones(eltype(initial_state), maxthreadid(), ks.ps.nx),
         limiter,
         sensor_smooth,
         sensor_nonsmooth,
@@ -1470,7 +1490,7 @@ function print_sod_diagnostics(result)
     println("Active-flux full-Boltzmann Sod integration completed")
     println("  model: 1d1f3v FSM, K=0, γ=5/3")
     println("  Knudsen number: ", result.ks.gas.Kn)
-    println("  Julia collision threads: ", result.collision_threads)
+    println("  Julia transport/collision threads: ", result.collision_threads)
     println("  transport limiter: ", result.limiter)
     println(
         "  minimum post-transport cell distribution: ",
