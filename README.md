@@ -96,7 +96,10 @@ inflow/outflow boundaries. Its production defaults are `nx=100` physical cells
 average/endpoint entries) and a `64×28×28` molecular-velocity grid. The
 complete Boltzmann collision integral is
 evaluated by the fast spectral method at four reconstructed physical
-quadrature points per cell and at every active-flux interface point. A
+quadrature points per cell and at every active-flux interface point. Five FSM
+angular modes are mandatory; the solver and plotting program reject lower-mode
+settings or saved results because they substantially under-resolve the
+collision strength. A
 five-invariant projection removes the velocity-quadrature defect. The
 two-stage successive BGK penalty evaluates the full FSM operator once per
 collision call and uses two analytically eliminated implicit relaxation
@@ -196,9 +199,10 @@ comparison to `tex/figures/normal-shock-comparison.pdf`; it never starts a
 kinetic simulation. Optional command-line arguments select the simulation
 output path, or (for the plotting program) the two input paths and figure path.
 The shared solver in `src/shock.jl` uses `1d1f3v`, `K=0`, and `gamma=5/3`.
-Its defaults are meant for a quick implementation check; longer final times
-and refined physical and velocity grids are needed for a steady resolved
-study.
+Its full-Boltzmann backend likewise fixes the FSM angular-mode count at five.
+Its remaining defaults are meant for a quick implementation check; longer
+final times and refined physical and velocity grids are needed for a steady
+resolved study.
 
 The two convergence programs deliberately retain the exact characteristic
 active-flux update and Strang splitting because they isolate spatial accuracy:

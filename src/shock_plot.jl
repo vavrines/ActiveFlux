@@ -40,6 +40,12 @@ function load_normal_shock_data(path, expected_model)
         "expected $expected_model data in $path, found " *
         string(data["collision_model"]),
     )
+    if expected_model == "fsm"
+        get(data["parameters"], "fsm_modes", nothing) == 5 || error(
+            "the Boltzmann comparison requires a five-mode FSM result in " *
+            "$path; rerun shock_boltzmann.jl with nm=5",
+        )
+    end
     return data
 end
 

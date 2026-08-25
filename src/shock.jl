@@ -135,12 +135,15 @@ function create_normal_shock_solver(;
     knudsen=1.0,
     cfl=0.35,
     max_time=0.30,
-    nm=3,
+    nm=5,
     alpha=1.0,
     omega=0.72,
 )
     collision_model in (:fsm, :bgk) ||
         throw(ArgumentError("collision_model must be :fsm or :bgk"))
+    nm == 5 || throw(ArgumentError(
+        "the normal-shock comparison requires nm=5; received nm=$nm",
+    ))
 
     set = Setup(;
         case="normal_shock",
@@ -1090,6 +1093,7 @@ function normal_shock_result_data(result)
             "nu" => ks.vs.nu,
             "nv" => ks.vs.nv,
             "nw" => ks.vs.nw,
+            "fsm_modes" => isnothing(ks.gas.fsm) ? nothing : ks.gas.fsm.nm,
         ),
         "grid" => Dict{String,Any}(
             "x" => collect(ks.ps.x[1:nx]),

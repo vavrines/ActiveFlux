@@ -40,6 +40,10 @@ function load_sod_data(path, expected_knudsen)
     get(data, "collision_model", "") == "fsm" ||
         error("expected full-Boltzmann FSM data in $path")
     parameters = data["parameters"]
+    get(parameters, "fsm_modes", nothing) == 5 || error(
+        "Figure 4 requires a five-mode FSM result in $path; " *
+        "rerun the simulation with nm=5",
+    )
     get(parameters, "transport_limiter", "") == "macroscopic_local" ||
         error("Figure 4 requires macroscopic-local limiter data in $path")
     knudsen = parameters["knudsen"]

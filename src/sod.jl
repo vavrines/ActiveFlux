@@ -371,10 +371,13 @@ function create_sod_solver(;
     velocity_limit=6.0,
     cfl=0.45,
     max_time=0.12,
-    nm=2,
+    nm=5,
     alpha=1.0,
     omega=0.72,
 )
+    nm == 5 || throw(ArgumentError(
+        "the production full-Boltzmann solver requires nm=5; received nm=$nm",
+    ))
     set = Setup(;
         case="sod",
         space="1d1f3v",
